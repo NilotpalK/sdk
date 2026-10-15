@@ -230,6 +230,7 @@ struct Host {
     acknowledgements: Mutex<Vec<wire::ClientFrame>>,
     lost_ack: AtomicBool,
     hold_ack: AtomicBool,
+    complete_on_ack: AtomicBool,
     trace: Mutex<Option<BoxProviderStream<'static, Result<wire::Delivery>>>>,
     state: Mutex<Option<wire::CompletionState>>,
     through: AtomicUsize,
@@ -241,6 +242,11 @@ impl HarnessWireApi for Host {
         Box::pin(async move {
             if self.hold_ack.load(Ordering::Relaxed) {
                 std::future::pending::<()>().await;
+            }
+            if request.through_revision == self.through.load(Ordering::Relaxed) as u64
+                && self.complete_on_ack.swap(false, Ordering::Relaxed)
+            {
+                *self.state.lock().unwrap() = Some(wire::CompletionState::Succeeded);
             }
             self.acknowledgements
                 .lock()

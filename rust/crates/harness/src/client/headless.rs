@@ -180,7 +180,7 @@ async fn follow<S: ClientStateStore>(
                 }
                 // Freeze each observed cut while catching up. Scheduler revisions
                 // and aggregate revisions are independent; only this cursor is a fence.
-                if caught_up {
+                if caught_up || (completion(&status).is_none() && reached(client, &status)?) {
                     status = observe(client, target, output).await?;
                 }
             }

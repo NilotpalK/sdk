@@ -86,7 +86,14 @@ async fn every_settled_outcome_has_its_documented_exit_code() {
         assert_eq!(outcome, expected);
         assert_eq!(outcome.exit_code(), exit_code);
         let frames = frames(output);
-        assert_eq!(frames.len(), 4);
+        assert_eq!(
+            frames.len(),
+            if expected == HeadlessOutcome::Blocked {
+                5
+            } else {
+                4
+            }
+        );
         assert!(matches!(
             frames[0].frame,
             Some(wire::server_frame::Frame::Handshake(_))
@@ -218,6 +225,28 @@ async fn successful_idle_exits_at_the_cut_without_a_terminal_event_or_eof() {
             LifecycleState::Active
         );
     }
+}
+
+#[tokio::test]
+async fn running_status_is_refreshed_when_replay_reaches_its_cut() {
+    let host = Arc::new(Host::default());
+    trace(
+        &host,
+        &[LifecycleState::Active, LifecycleState::Active],
+        wire::CompletionState::Running,
+    );
+    host.complete_on_ack.store(true, Ordering::Relaxed);
+    let replay = host.trace.lock().unwrap().take().unwrap();
+    *host.trace.lock().unwrap() = Some(Box::pin(replay.chain(futures::stream::pending())));
+    let mut client = HarnessClient::connect(host, session()).await.unwrap();
+    assert_eq!(
+        run_headless(&mut client, command(), target(), &mut Vec::new())
+            .now_or_never()
+            .expect("refresh the running snapshot at its cut")
+            .unwrap(),
+        HeadlessOutcome::Completed
+    );
+    assert_eq!(client.session().resume().cursors[0].revision, 2);
 }
 
 #[tokio::test]

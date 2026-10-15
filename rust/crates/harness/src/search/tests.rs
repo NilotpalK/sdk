@@ -1,0 +1,93 @@
+use super::*;
+use crate::{
+    OperationId,
+    test_support::{ScriptedSearch, ScriptedSearchProvider},
+    tool::ToolInvocation,
+};
+use std::sync::Arc;
+
+#[test]
+fn request_and_catalog_contracts() -> Result<()> {
+    let spec = spec()?;
+    spec.definition.validate(&mut None)?;
+    for (query, limit, valid) in [
+        ("test".into(), 1, true),
+        ("test".into(), 20, true),
+        ("".into(), 1, false),
+        (" \n\t".into(), 1, false),
+        ("test".into(), 0, false),
+        ("test".into(), 21, false),
+        ("a".repeat(4097), 1, false),
+    ] {
+        assert_eq!(
+            SearchRequest {
+                query,
+                max_results: limit
+            }
+            .validate()
+            .is_ok(),
+            valid
+        );
+    }
+    for invalid in [
+        serde_json::json!({"query":"test", "key":"must-not-accept"}),
+        serde_json::json!({"query":"test", "max_results":-1}),
+    ] {
+        assert!(serde_json::from_value::<SearchRequest>(invalid).is_err());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn scripted_search_checks_requests_exhaustion_and_uncertain_reconciliation() -> Result<()> {
+    let request = SearchRequest {
+        query: "test".into(),
+        max_results: 5,
+    };
+    let response = SearchResponse { results: vec![] };
+    let search = Arc::new(ScriptedSearchProvider::new([ScriptedSearch {
+        request: request.clone(),
+        response: Some(response.clone()),
+        error: None,
+    }])?);
+    let wrong = SearchRequest {
+        query: "wrong".into(),
+        max_results: 5,
+    };
+    assert!(matches!(
+        search.search(&wrong).await,
+        Err(Error::Conflict(_))
+    ));
+    assert_eq!(search.remaining(), 1);
+    let tool = web_search(search.clone())?;
+    let invocation = ToolInvocation {
+        operation_id: OperationId::new(),
+        call_id: "search".into(),
+        name: "web_search".into(),
+        arguments: serde_json::json!({"query":"test"}),
+    };
+    assert!(
+        tool.executor
+            .reconcile(invocation.clone(), None)
+            .await?
+            .is_none()
+    );
+    assert_eq!(
+        search.remaining(),
+        1,
+        "reconciliation must never reissue search"
+    );
+    let result = tool.executor.execute(invocation.clone(), None).await?;
+    assert_eq!(result.value, serde_json::json!({"results":[]}));
+    assert_eq!(search.remaining(), 0);
+    assert!(tool.executor.execute(invocation, None).await.is_err());
+    assert!(
+        ScriptedSearchProvider::new([ScriptedSearch {
+            request,
+            response: Some(response),
+            error: Some("ambiguous".into()),
+        }])
+        .is_err()
+    );
+    Ok(())
+}

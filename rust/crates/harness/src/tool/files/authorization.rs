@@ -94,6 +94,18 @@ impl FileTool {
             })
         };
         let (file, custody) = match *self {
+            Self::Plan => {
+                let input =
+                    decode::<super::super::plan::UpdatePlanInput>(&invocation.arguments, work)?;
+                input.0.validate(&input.1)?;
+                if super::super::plan::PLAN_PATH.len() > scope.limits().path_bytes {
+                    return Err(error(
+                        crate::wire::ErrorCode::Invalid,
+                        "plan path exceeds task path bound",
+                    ));
+                }
+                return Ok((None, input.1));
+            }
             Self::Write => {
                 let input = decode::<WriteFileInput>(&invocation.arguments, work)?;
                 self.public_path(&input.0.path, io)?;

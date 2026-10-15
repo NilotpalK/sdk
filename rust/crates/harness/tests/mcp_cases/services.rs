@@ -16,7 +16,7 @@ use acyclic_harness::{
     runtime::{
         InteractionRouter, RuntimeScope, TaskContext, TaskDefinition, TaskRegistry, ToolContext,
     },
-    test_support::{ScriptedEvent, ScriptedModelProvider, ScriptedTurn},
+    test_support::{ScriptedEvent, ScriptedModelProvider, ScriptedReconciliation, ScriptedTurn},
     tool::ToolRegistry,
 };
 use serde_json::{Value, json};
@@ -588,6 +588,11 @@ async fn remote_callback_cancellation_drops_recorded_model_without_replay() -> R
     let signal = Arc::clone(&dispatched);
     let model = Arc::new(
         sampling_model([ScriptedTurn::Events(vec![ScriptedEvent::Pending {}])])
+            .with_reconciliations([ScriptedReconciliation {
+                orphan: false,
+                observed: vec![],
+                continuation: None,
+            }])
             .with_dispatch_observer(move |_| signal.notify_one()),
     );
     let callbacks: Arc<McpRuntimeCallbacks> = Arc::new(McpRuntimeCallbacks::new(
@@ -659,6 +664,8 @@ async fn remote_callback_cancellation_drops_recorded_model_without_replay() -> R
     ));
     assert_eq!(model.dispatches().len(), 1);
     assert_sampling_text(&model)?;
+    assert_eq!(model.reconciliations().len(), 1);
+    assert!(model.recoveries().is_empty());
     server
         .await
         .map_err(|error| Error::Storage(error.to_string()))??;

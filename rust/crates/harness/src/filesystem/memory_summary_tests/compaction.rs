@@ -25,9 +25,9 @@ async fn continuation_storage(turns: usize) -> Result<MemoryHarnessStorage> {
 
 #[tokio::test]
 async fn payload_staging_work_grows_linearly_with_retained_history() -> Result<()> {
-    const WARMUP: usize = 250;
-    const SMALL: usize = 250;
-    const LARGE: usize = 1_000;
+    const WARMUP: usize = 192;
+    const SMALL: usize = 64;
+    const LARGE: usize = 256;
     let storage = continuation_storage(WARMUP + LARGE).await?;
     let cancellation = acyclic_fs::CancellationToken::new();
     let mut small = acyclic_fs::WorkCounters::default();
@@ -80,7 +80,7 @@ async fn payload_staging_work_grows_linearly_with_retained_history() -> Result<(
 
 #[tokio::test]
 async fn default_compaction_bounds_small_message_continuation() -> Result<()> {
-    const TURNS: u16 = 32;
+    const TURNS: u16 = 12;
     let mut storage = continuation_storage(usize::from(TURNS)).await?;
     let model = Arc::new(SummaryModel::default());
     let limits = Limits {

@@ -226,21 +226,19 @@ impl MemoryStream {
             .ok_or(StreamError::Capacity)?;
         if needed > state.retained.capacity() {
             let (mut buffer, claim) = self.vector(needed.next_power_of_two())?;
+            #[cfg(not(target_arch = "wasm32"))]
+            let copied = (state.retained.len() * std::mem::size_of::<Retained>()) as u64;
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some(work) = &self.work {
+                work.record(work.meter.admit_codec(0, copied, 0))?;
+            }
             buffer.append(&mut state.retained);
             state.retained = buffer;
             state.retained_allocation = claim;
-        }
-        let replay_needed = state
-            .replays
-            .len()
-            .checked_add(reserved(state).0)
-            .and_then(|len| len.checked_add(1))
-            .ok_or(StreamError::Capacity)?;
-        if replay_needed > state.replays.capacity() {
-            let (mut buffer, claim) = self.vector(replay_needed.next_power_of_two())?;
-            buffer.append(&mut state.replays);
-            state.replays = buffer;
-            state.replay_allocation = claim;
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some(work) = &self.work {
+                work.record(work.meter.record_codec(0, copied, 0))?;
+            }
         }
         Ok(())
     }

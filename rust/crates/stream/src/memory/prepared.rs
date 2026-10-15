@@ -26,7 +26,6 @@ pub(crate) struct PreparedCommit {
     plan: CommitPlan,
     conflicts: [(Vec<CommitConflict>, Allocation); 2],
     capacity: Option<CapacityReservation>,
-    inventory: Option<(Vec<Retained>, Allocation)>,
 }
 
 impl MemoryStream {
@@ -76,12 +75,7 @@ impl MemoryStream {
                 bytes: maximum,
             })
         };
-        let needed = state.retained.len() + reserved(&state).0 + 1;
-        let inventory = if needed > state.retained.capacity() {
-            Some(self.vector(needed.next_power_of_two())?)
-        } else {
-            None
-        };
+        self.reserve_retained(&mut state)?;
         let mut plan = self.plan_commit(&mut state, &request, CommitId::default(), 0)?;
         for value in [&mut plan.result, &mut plan.cached] {
             let append = append_mut(value);
@@ -125,7 +119,6 @@ impl MemoryStream {
                 plan,
                 conflicts: [conflict, (cached_conflicts, conflict_claim)],
                 capacity,
-                inventory,
             },
             recovery,
         ))
@@ -273,12 +266,6 @@ impl PreparedCommit {
                 }
             }
             drop(self.capacity.take());
-            if state.retained.len() == state.retained.capacity() {
-                let (mut buffer, claim) = self.inventory.take().ok_or(StreamError::Unavailable)?;
-                buffer.append(&mut state.retained);
-                state.retained = buffer;
-                state.retained_allocation = claim;
-            }
             let bytes = if conflicts.is_empty() { body.len() } else { 0 };
             self.provider.publish(bytes, || {
                 if conflicts.is_empty() {

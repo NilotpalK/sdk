@@ -98,22 +98,21 @@ fn retain(
     };
     let entry = Retained {
         replay: key.map(|key| key.0),
+        replay_left: None,
+        replay_right: None,
+        replay_height: 1,
         digest,
         result,
         envelope,
         _allocation: allocation,
     };
     if entry.envelope().is_some() || entry.replay.is_some() {
-        if let Some(key) = &entry.replay {
-            let position = state.replays.partition_point(|index| {
-                state
-                    .retained
-                    .get(*index)
-                    .and_then(|entry| entry.replay.as_deref())
-                    .is_some_and(|stored| stored < key.as_ref())
-            });
-            state.replays.insert(position, state.retained.len());
-        }
+        let keyed = entry.replay.is_some();
+        let index = state.retained.len();
         state.retained.push(entry);
+        if keyed {
+            state.replay_root = Some(state.insert_replay(state.replay_root, index));
+            state.replay_count += 1;
+        }
     }
 }

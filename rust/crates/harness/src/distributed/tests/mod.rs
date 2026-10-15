@@ -22,6 +22,12 @@ mod cancellation;
 mod fencing;
 #[cfg(feature = "filesystem")]
 mod limits;
+#[cfg(all(
+    feature = "model-checking",
+    feature = "filesystem",
+    not(target_arch = "wasm32")
+))]
+mod model_checking;
 #[cfg(all(feature = "filesystem", not(target_arch = "wasm32")))]
 mod native;
 mod observation;

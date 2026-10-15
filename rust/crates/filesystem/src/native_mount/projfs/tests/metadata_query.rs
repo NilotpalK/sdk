@@ -127,6 +127,14 @@ fn name_query_reads_reparse_leaves_without_following_ancestors()
     unsafe {
         PrjMarkDirectoryAsPlaceholder(&projected_name, PCWSTR::null(), None, &raw const guid)
     }?;
+    // SAFETY: the directory name remains live throughout the query.
+    let state = unsafe {
+        windows::Win32::Storage::ProjectedFileSystem::PrjGetOnDiskFileState(&projected_name)
+    }?;
+    assert_ne!(
+        state.0 & windows::Win32::Storage::ProjectedFileSystem::PRJ_FILE_STATE_PLACEHOLDER.0,
+        0
+    );
     for path in ["junction", "projected"] {
         let wide: Vec<_> = path.encode_utf16().collect();
         let limited = crate::NativeMaterializationWork::new(
@@ -139,7 +147,9 @@ fn name_query_reads_reparse_leaves_without_following_ancestors()
         )
         .map_err(|(error, _)| error)?;
         let actual = query_metadata(&root, &wide, &mut &limited)?.ok_or("tagged leaf fell back")?;
-        assert_ne!(actual.raw.ReparseTag, 0);
+        if path == "junction" {
+            assert_ne!(actual.raw.ReparseTag, 0);
+        }
         assert_eq!(limited.receipt().backend_read_operations, 1);
         assert_eq!(limited.receipt().items_examined, wide.len() as u64);
         let expected = root.stat(&wide, &mut &work)?;

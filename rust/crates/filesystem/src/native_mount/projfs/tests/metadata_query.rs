@@ -209,9 +209,10 @@ fn fallback_preserves_the_original_tight_budget() -> Result<(), Box<dyn std::err
             &crate::CancellationToken::new(),
         )
         .map_err(|(error, _)| error)?;
-        let actual = match query_metadata(&root, &wide, &mut &limited)? {
-            Some(stat) => Ok(stat),
-            None => root.stat(&wide, &mut &limited),
+        let actual = match query_metadata(&root, &wide, &mut &limited) {
+            Ok(Some(stat)) => Ok(stat),
+            Ok(None) => root.stat(&wide, &mut &limited),
+            Err(error) => Err(error),
         };
         match (actual, expected) {
             (Ok(actual), Ok(expected)) => assert_eq!(actual.raw.FileId, expected.raw.FileId),
@@ -219,6 +220,57 @@ fn fallback_preserves_the_original_tight_budget() -> Result<(), Box<dyn std::err
             other => return Err(format!("fallback changed result: {other:?}").into()),
         }
         assert_eq!(limited.receipt(), receipt);
+    }
+    Ok(())
+}
+
+#[test]
+fn failed_queries_record_attempts_and_reuse_validation() -> Result<(), Box<dyn std::error::Error>> {
+    let original = work()?;
+    let temporary = tempfile::tempdir()?;
+    std::fs::write(temporary.path().join("leaf"), b"contents")?;
+    let root = HostRoot::open(temporary.path(), &mut &original)?;
+    let path: Vec<_> = "leaf".encode_utf16().collect();
+    for unsupported in [None, Some(1), Some(50), Some(87), Some(124)] {
+        for reads in [1, 2, 3] {
+            let limited = crate::NativeMaterializationWork::new(
+                crate::WorkBudget {
+                    items_examined: path.len() as u64,
+                    backend_read_operations: reads,
+                    ..crate::WorkBudget::UNBOUNDED
+                },
+                &crate::CancellationToken::new(),
+            )
+            .map_err(|(error, _)| error)?;
+            let mut queries = 0;
+            let result = query_metadata_using(&root, &path, &mut &limited, |_, _| {
+                queries += 1;
+                unsupported.map_or(Ok(None), |code| {
+                    Err(std::io::Error::from_raw_os_error(code))
+                })
+            });
+            let result = match result {
+                Ok(None) => root.stat(&path, &mut &limited).map(Some),
+                result => result,
+            };
+            assert_eq!(queries, usize::from(reads != 2));
+            assert_eq!(result.is_ok(), reads >= 2);
+            assert_eq!(limited.receipt().backend_read_operations, reads);
+            assert_eq!(limited.receipt().items_examined, path.len() as u64);
+        }
+    }
+    for code in [2, 5, 32] {
+        let limited = work()?;
+        let error = query_metadata_using(&root, &path, &mut &limited, |_, _| {
+            Err(std::io::Error::from_raw_os_error(code))
+        })
+        .err()
+        .ok_or("failed query unexpectedly succeeded")?;
+        assert!(
+            matches!(error, crate::NativeTreeMaterializationError::Io(error) if error.raw_os_error() == Some(code))
+        );
+        assert_eq!(limited.receipt().backend_read_operations, 1);
+        assert_eq!(limited.receipt().items_examined, path.len() as u64);
     }
     Ok(())
 }

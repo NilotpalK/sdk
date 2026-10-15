@@ -108,6 +108,20 @@ fn query_metadata(
     path: &[u16],
     work: &mut &crate::NativeMaterializationWork,
 ) -> Result<Option<crate::native_host::HostStat>, crate::NativeTreeMaterializationError> {
+    query_metadata_using(root, path, work, |name, volume| {
+        crate::native_host::stat_windows_name(&root.directory, name, volume, true)
+    })
+}
+
+fn query_metadata_using(
+    root: &HostRoot,
+    path: &[u16],
+    work: &mut &crate::NativeMaterializationWork,
+    query: impl FnOnce(
+        &windows::Win32::Foundation::UNICODE_STRING,
+        u32,
+    ) -> std::io::Result<Option<crate::native_host::HostStat>>,
+) -> Result<Option<crate::native_host::HostStat>, crate::NativeTreeMaterializationError> {
     NativeHostWork::check(work)?;
     // Only leaf names use the query. Parent traversal retains the held-handle
     // validator, including its rejection of every reparse-tagged directory.
@@ -122,25 +136,30 @@ fn query_metadata(
     {
         return Ok(None);
     }
+    // Two reads fit the original open + stat, but cannot also pay for an
+    // unsupported name query. Choose that path before attempting any I/O.
+    if work.remaining()?.backend_read_operations == 2 {
+        return Ok(None);
+    }
     let charge = crate::WorkCounters {
         items_examined: path.len() as u64,
         backend_read_operations: 1,
         ..crate::WorkCounters::UNCHARGED
     };
-    // Admit before I/O. Commit the fast-path charge only when it supplies the
-    // result; otherwise the original stat path performs its own charging.
-    let credit = work.reserve_work(charge)?;
     let name = windows::Win32::Foundation::UNICODE_STRING {
         Length: length,
         MaximumLength: length,
         Buffer: windows::core::PWSTR(path.as_ptr().cast_mut()),
     };
-    match crate::native_host::stat_windows_name(&root.directory, &name, volume, true) {
-        Ok(Some(metadata)) => {
-            credit.record_completed(credit.remaining_work())?;
-            Ok(Some(metadata))
+    match work.attempt_io(charge, || query(&name, volume)) {
+        Ok(Some(metadata)) => Ok(Some(metadata)),
+        Ok(None) => root.stat(path, &mut &work.recheck_admitted()).map(Some),
+        Err(crate::NativeTreeMaterializationError::Io(error))
+            if matches!(error.raw_os_error(), Some(1 | 50 | 87 | 124)) =>
+        {
+            root.stat(path, &mut &work.recheck_admitted()).map(Some)
         }
-        Ok(None) | Err(_) => Ok(None),
+        Err(error) => Err(error),
     }
 }
 

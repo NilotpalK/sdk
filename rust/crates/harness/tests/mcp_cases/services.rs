@@ -12,7 +12,7 @@ use acyclic_harness::{
         callbacks::{McpCallbackPolicy, McpCallbackRequest, McpRuntimeCallbacks},
         http::{HttpMcpTransport, NativeMcpHttpProvider},
     },
-    model::{Model, ModelContent, ModelEvent},
+    model::{Model, ModelContent, ModelContentPart, ModelEvent},
     runtime::{
         InteractionRouter, RuntimeScope, TaskContext, TaskDefinition, TaskRegistry, ToolContext,
     },
@@ -62,7 +62,9 @@ fn assert_sampling_text(model: &ScriptedModelProvider) -> Result<()> {
     );
     assert_eq!(
         request.messages.last().map(|message| &message.content),
-        Some(&ModelContent::Text("callback".into()))
+        Some(&ModelContent::Parts(vec![ModelContentPart::Text {
+            text: "callback".into()
+        }]))
     );
     assert_eq!(model.remaining(), 0);
     Ok(())

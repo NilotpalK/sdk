@@ -40,10 +40,15 @@ pub(super) fn record_post_operation_failure(
     let mut failure = lock_recover(failure);
     match (retry_path, result) {
         (_, Ok(())) => {}
-        (Some(retry_path), Err(error)) => {
+        (None, Err(_)) if notification == PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_NO_MODIFICATION => {}
+        (Some(retry_path), Err(error))
+            if notification != PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_NO_MODIFICATION =>
+        {
             failure.queue_capture(retry_path.clone(), error.to_string());
         }
-        (None, Err(error)) => {
+        (_, Err(error)) => {
+            // A metadata-only failure cannot be replayed as a full-file capture:
+            // doing so could replace a concurrent source content change.
             if failure.unreplayable.is_none() {
                 failure.unreplayable = Some(format!("{notification:?} at {path:?}: {error}"));
             }
@@ -232,7 +237,11 @@ pub(super) unsafe fn notification(
                 return Ok(());
             }
             let cached_binding = lock_recover(projection).get(&capture_path).copied();
-            if !metadata_changed_since_open(baseline, host)
+            let metadata_changed = metadata_changed_since_open(baseline, host);
+            if !metadata_changed {
+                *retry_path.borrow_mut() = None;
+            }
+            if !metadata_changed
                 && !has_pending_capture(operation_failures.as_ref(), &capture_path)
                 && let Some(binding) = cached_binding
                 && binding.host == host
@@ -249,22 +258,20 @@ pub(super) unsafe fn notification(
             let basis = ReadBasis::sample(source.as_ref());
             let lookup = source.lookup(&capture_path);
             match lookup {
-                Ok(Some(_)) if metadata_changed_since_open(baseline, host) => {
-                    metadata_edits.with(&host.identity, || {
-                        let Some(lookup) = source.lookup(&capture_path)? else {
-                            defer_host_capture(operation_failures.as_ref(), capture_path);
-                            return Ok(());
-                        };
-                        capture_changed_windows_metadata(
-                            source.as_ref(),
-                            &capture_path,
-                            lookup.metadata,
-                            baseline,
-                            host,
-                            &work,
-                        )
-                    })
-                }
+                Ok(Some(_)) if metadata_changed => metadata_edits.with(&host.identity, || {
+                    let Some(lookup) = source.lookup(&capture_path)? else {
+                        defer_host_capture(operation_failures.as_ref(), capture_path);
+                        return Ok(());
+                    };
+                    capture_changed_windows_metadata(
+                        source.as_ref(),
+                        &capture_path,
+                        lookup.metadata,
+                        baseline,
+                        host,
+                        &work,
+                    )
+                }),
                 Ok(Some(lookup)) => {
                     if let Some(basis) = basis
                         && !has_pending_capture(operation_failures.as_ref(), &capture_path)

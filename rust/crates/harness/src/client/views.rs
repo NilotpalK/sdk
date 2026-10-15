@@ -102,13 +102,15 @@ impl ClientViews {
                 transcript.messages.push(*message);
             }
             EventPayload::ForkPublished { seed } => {
-                self.tasks
+                let child = self
+                    .tasks
                     .entry(authority_key(&encode_authority(&seed.child)))
                     .or_insert(TaskView {
                         status: LifecycleState::Pending,
                         reason: None,
-                        parent: Some(seed.parent),
+                        parent: None,
                     });
+                child.parent = Some(seed.parent);
             }
             _ => {}
         }

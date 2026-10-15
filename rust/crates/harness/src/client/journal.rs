@@ -36,12 +36,14 @@ impl FileClientState {
         // Open the data only after acquiring the stable lock: a paused opener must
         // see the current inode after a checkpoint replaces the data file.
         let file = open_file(&path)?;
-        Ok(Self {
+        let mut state = Self {
             file,
             _lock: lock,
             poisoned: false,
             path,
-        })
+        };
+        state.sync_parent()?;
+        Ok(state)
     }
 
     fn check(&self) -> Result<()> {
@@ -49,6 +51,17 @@ impl FileClientState {
             return Err(Error::Storage(
                 "client journal needs reopening after an I/O failure".into(),
             ));
+        }
+        Ok(())
+    }
+
+    fn sync_parent(&mut self) -> Result<()> {
+        #[cfg(unix)]
+        if let Some(parent) = self.path.parent()
+            && let Err(error) = File::open(parent).and_then(|directory| directory.sync_all())
+        {
+            self.poisoned = true;
+            return Err(storage(error));
         }
         Ok(())
     }
@@ -122,14 +135,7 @@ impl ClientStateStore for FileClientState {
         file.sync_all().map_err(storage)?;
         std::fs::rename(&temporary, &self.path).map_err(storage)?;
         self.file = file;
-        #[cfg(unix)]
-        if let Some(parent) = self.path.parent()
-            && let Err(error) = File::open(parent).and_then(|directory| directory.sync_all())
-        {
-            self.poisoned = true;
-            return Err(storage(error));
-        }
-        Ok(())
+        self.sync_parent()
     }
 }
 

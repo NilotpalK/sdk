@@ -243,3 +243,110 @@ async fn resubmitting_an_earlier_intent_leaves_later_intents_queued() {
     assert_eq!(host.commands.lock().unwrap().as_slice(), &[command(), next]);
     assert_eq!(client.session().pending().count(), 0);
 }
+
+#[cfg(unix)]
+#[test]
+fn opening_a_journal_requires_its_directory_entry_to_be_synced() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("client.journal");
+    // File creation requires write+search, while opening the directory for sync
+    // requires read permission. This fails the durability boundary deterministically.
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o300)).unwrap();
+    let opened = FileClientState::open(&path);
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(matches!(opened, Err(Error::Storage(_))));
+    let mut state = ClientSession::open(FileClientState::open(&path).unwrap()).unwrap();
+    state.queue(command()).unwrap();
+    drop(state);
+    let recovered = ClientSession::open(FileClientState::open(&path).unwrap()).unwrap();
+    assert_eq!(
+        recovered.pending().cloned().collect::<Vec<_>>(),
+        [command()]
+    );
+}
+
+#[test]
+fn fork_lineage_and_child_lifecycle_are_independent_of_cross_authority_order() {
+    use acyclic_harness::{fork::ForkSeed, wire_codec::encode_authority};
+    let seed: ForkSeed =
+        serde_json::from_str(include_str!("../fixtures/v2/fork-seed.json")).unwrap();
+    seed.validate(&mut None).unwrap();
+    let parent = encode_authority(&seed.parent);
+    let child = encode_authority(&seed.child);
+    let event = |authority: &wire::Authority, revision, kind: &str, payload: EventPayload| {
+        let mut value = delivery(revision, LifecycleState::Active);
+        value.authority = Some(authority.clone());
+        let event = value.events.first_mut().unwrap();
+        event.authority = Some(authority.clone());
+        event.event_type = kind.into();
+        event.canonical_payload_json = serde_json::to_vec(&payload).unwrap();
+        frame(value)
+    };
+    let fork = event(
+        &parent,
+        seed.parent_revision,
+        "fork_published",
+        EventPayload::ForkPublished {
+            seed: Box::new(seed.clone()),
+        },
+    );
+    let active = event(
+        &child,
+        0,
+        "lifecycle_transitioned",
+        EventPayload::LifecycleTransitioned {
+            from: LifecycleState::Pending,
+            to: LifecycleState::Active,
+            reason: Some("working".into()),
+        },
+    );
+    for fork_first in [false, true] {
+        let mut state = session();
+        for authority in [&parent, &child] {
+            state
+                .track(wire::ReplayCursor {
+                    authority: Some(authority.clone()),
+                    generation: "generation".into(),
+                    revision: 0,
+                })
+                .unwrap();
+        }
+        let transitions = [
+            (LifecycleState::Pending, LifecycleState::Active),
+            (LifecycleState::Active, LifecycleState::Waiting),
+            (LifecycleState::Waiting, LifecycleState::Active),
+        ];
+        assert_eq!(seed.parent_revision, transitions.len() as u64);
+        for (revision, (from, to)) in transitions.into_iter().enumerate() {
+            state
+                .receive(event(
+                    &parent,
+                    revision as u64,
+                    "lifecycle_transitioned",
+                    EventPayload::LifecycleTransitioned {
+                        from,
+                        to,
+                        reason: None,
+                    },
+                ))
+                .unwrap();
+        }
+        let ordered = if fork_first {
+            [fork.clone(), active.clone()]
+        } else {
+            [active.clone(), fork.clone()]
+        };
+        for frame in ordered {
+            state.receive(frame).unwrap();
+        }
+        let child = &state.views().tasks["AGGREGATE_KIND_CONVERSATION:child"];
+        assert_eq!(child.parent, Some(seed.parent.clone()));
+        assert_eq!(child.status, LifecycleState::Active);
+        assert_eq!(child.reason.as_deref(), Some("working"));
+        state.checkpoint().unwrap();
+        let views = state.views().clone();
+        let recovered = ClientSession::open(state.into_store()).unwrap();
+        assert_eq!(recovered.views(), &views);
+    }
+}

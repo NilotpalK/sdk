@@ -17,6 +17,11 @@ build = "build.rs"
 name = "main"
 path = "tests/main.rs"
 
+[[test]]
+name = "context-discovery"
+path = "tests/context_discovery.rs"
+required-features = ["filesystem"]
+
 [lib]
 crate-type = ["rlib", "cdylib"]
 
@@ -48,6 +53,7 @@ name = "client_demand"
 harness = false
 
 [features]
+test-support = []
 browser = ["wasm", "filesystem", "acyclic-fs/browser"]
 # Native presentation only; this does not select providers or grant authority.
 terminal = ["dep:hex"]
@@ -109,6 +115,7 @@ tracing.workspace = true
 tokio = { version = "1.48.0", default-features = false, features = ["signal"] }
 
 [dev-dependencies]
+acyclic-harness = { version = "=0.2.0", path = ".", features = ["test-support"] }
 acyclic-objects = { version = "=0.2.0", path = "../objects", default-features = false }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]

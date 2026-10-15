@@ -31,6 +31,11 @@ name = "context-discovery"
 path = "tests/context_discovery.rs"
 required-features = ["filesystem"]
 
+[[test]]
+name = "client-commands"
+path = "tests/client_commands.rs"
+required-features = ["filesystem"]
+
 [lib]
 crate-type = ["rlib", "cdylib"]
 

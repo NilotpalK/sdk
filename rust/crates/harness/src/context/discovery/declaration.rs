@@ -13,7 +13,7 @@ pub struct ContextRoot {
 }
 
 impl ContextRoot {
-    pub(super) fn validate(
+    pub(crate) fn validate(
         &self,
         work: &mut Option<&mut dyn crate::store::history::HistoryIo>,
     ) -> Result<()> {
@@ -225,7 +225,7 @@ impl Default for ContextDiscoveryLimits {
 }
 
 impl ContextDiscoveryLimits {
-    pub(super) fn validate(self) -> Result<()> {
+    pub(crate) fn validate(self) -> Result<()> {
         if self.entries == 0
             || self.directories == 0
             || self.header_bytes == 0
@@ -257,7 +257,7 @@ pub struct PinnedContextPath {
 }
 
 impl PinnedContextPath {
-    pub(super) fn validate(
+    pub(crate) fn validate(
         &self,
         work: &mut Option<&mut dyn crate::store::history::HistoryIo>,
     ) -> Result<()> {

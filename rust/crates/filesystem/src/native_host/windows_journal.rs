@@ -158,7 +158,7 @@ pub(super) fn windows_stat_information<W: NativeHostWork>(
     })
 }
 
-pub(super) fn stat_windows_file<W: NativeHostWork>(
+pub(crate) fn stat_windows_file<W: NativeHostWork>(
     file: &impl std::os::windows::io::AsHandle,
     volume: u32,
     work: &mut W,

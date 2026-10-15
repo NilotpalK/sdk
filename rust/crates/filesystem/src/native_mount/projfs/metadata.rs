@@ -136,10 +136,10 @@ fn query_metadata_using(
     {
         return Ok(None);
     }
-    // Two reads fit the original open + stat, but cannot also pay for an
+    // Two reads fit a held-root open + stat, but cannot also pay for an
     // unsupported name query. Choose that path before attempting any I/O.
     if work.remaining()?.backend_read_operations == 2 {
-        return Ok(None);
+        return stat_leaf_metadata(root, path, volume, work).map(Some);
     }
     let charge = crate::WorkCounters {
         items_examined: path.len() as u64,
@@ -153,14 +153,36 @@ fn query_metadata_using(
     };
     match work.attempt_io(charge, || query(&name, volume)) {
         Ok(Some(metadata)) => Ok(Some(metadata)),
-        Ok(None) => root.stat(path, &mut &work.recheck_admitted()).map(Some),
+        Ok(None) => stat_leaf_metadata(root, path, volume, &mut &work.recheck_admitted()).map(Some),
         Err(crate::NativeTreeMaterializationError::Io(error))
             if matches!(error.raw_os_error(), Some(1 | 50 | 87 | 124)) =>
         {
-            root.stat(path, &mut &work.recheck_admitted()).map(Some)
+            stat_leaf_metadata(root, path, volume, &mut &work.recheck_admitted()).map(Some)
         }
         Err(error) => Err(error),
     }
+}
+
+fn stat_leaf_metadata(
+    root: &HostRoot,
+    path: &[u16],
+    volume: u32,
+    work: &mut &crate::NativeMaterializationWork,
+) -> Result<crate::native_host::HostStat, crate::NativeTreeMaterializationError> {
+    use windows::Wdk::Storage::FileSystem as nt;
+    use windows::Win32::Storage::FileSystem as fs;
+
+    // The caller already restricted this to one leaf. The held root can be
+    // borrowed directly; no parent traversal or duplicate handle is needed.
+    let file = crate::native_host::open_windows_at(
+        &root.directory,
+        path,
+        fs::FILE_READ_ATTRIBUTES | fs::SYNCHRONIZE,
+        nt::FILE_OPEN,
+        nt::FILE_SYNCHRONOUS_IO_NONALERT,
+        work,
+    )?;
+    crate::native_host::stat_windows_file(&file, volume, work)
 }
 
 pub(super) fn host_relative_path(path: &MountPath) -> Result<PathBuf, MountSourceError> {

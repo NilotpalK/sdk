@@ -185,6 +185,7 @@ fn name_query_reads_reparse_leaves_without_following_ancestors()
 fn fallback_preserves_the_original_tight_budget() -> Result<(), Box<dyn std::error::Error>> {
     let original = work()?;
     let temporary = tempfile::tempdir()?;
+    std::fs::write(temporary.path().join("leaf"), b"contents")?;
     std::fs::create_dir(temporary.path().join("nested"))?;
     std::fs::write(temporary.path().join("nested/leaf"), b"contents")?;
     let root = HostRoot::open(temporary.path(), &mut &original)?;
@@ -192,6 +193,7 @@ fn fallback_preserves_the_original_tight_budget() -> Result<(), Box<dyn std::err
         "",
         ".",
         "nested\\leaf",
+        "leaf",
         "missing",
         "leaf:stream",
         "nested\\..\\leaf",
@@ -219,7 +221,11 @@ fn fallback_preserves_the_original_tight_budget() -> Result<(), Box<dyn std::err
             (Err(actual), Err(expected)) => assert_eq!(actual.to_string(), expected.to_string()),
             other => return Err(format!("fallback changed result: {other:?}").into()),
         }
-        assert_eq!(limited.receipt(), receipt);
+        let mut expected_receipt = receipt;
+        if matches!(path, "leaf" | "missing") {
+            expected_receipt.backend_read_operations = 1;
+        }
+        assert_eq!(limited.receipt(), expected_receipt);
     }
     Ok(())
 }
@@ -232,7 +238,7 @@ fn failed_queries_record_attempts_and_reuse_validation() -> Result<(), Box<dyn s
     let root = HostRoot::open(temporary.path(), &mut &original)?;
     let path: Vec<_> = "leaf".encode_utf16().collect();
     for unsupported in [None, Some(1), Some(50), Some(87), Some(124)] {
-        for reads in [1, 2, 3] {
+        for reads in [1, 2, 3, 4] {
             let limited = crate::NativeMaterializationWork::new(
                 crate::WorkBudget {
                     items_examined: path.len() as u64,
@@ -254,8 +260,12 @@ fn failed_queries_record_attempts_and_reuse_validation() -> Result<(), Box<dyn s
                 result => result,
             };
             assert_eq!(queries, usize::from(reads != 2));
-            assert_eq!(result.is_ok(), reads >= 2);
-            assert_eq!(limited.receipt().backend_read_operations, reads);
+            assert_eq!(
+                result.is_ok(),
+                reads >= 2,
+                "{unsupported:?}, {reads}: {result:?}"
+            );
+            assert_eq!(limited.receipt().backend_read_operations, reads.min(3));
             assert_eq!(limited.receipt().items_examined, path.len() as u64);
         }
     }

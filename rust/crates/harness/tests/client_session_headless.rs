@@ -6,7 +6,7 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
 };
 
-fn target() -> wire::ObserveRequest {
+pub(super) fn target() -> wire::ObserveRequest {
     wire::ObserveRequest {
         operation_id: command().operation.unwrap().operation_id,
         protocol: Some(current_protocol()),
@@ -269,6 +269,8 @@ async fn waiting_only_blocks_at_the_current_cut_and_eof_cannot_replace_it() {
         &[LifecycleState::Active],
         wire::CompletionState::Succeeded,
     );
+    // This service cannot supply its advertised cut, even after a page refresh.
+    *host.snapshot_history.lock().unwrap() = Some(vec![delivery(0, LifecycleState::Active)]);
     host.through.store(2, Ordering::Relaxed);
     let mut client = HarnessClient::connect(host, session()).await.unwrap();
     assert!(matches!(
@@ -892,4 +894,106 @@ async fn settlement_drains_ready_stdin_and_replay() {
         .collect::<Vec<_>>();
     assert_eq!(deliveries, [final_delivery]);
     assert_eq!(client.session().resume().cursors[0].revision, 1);
+}
+
+#[tokio::test]
+async fn finite_replay_pages_reach_the_settlement_boundary() {
+    let host = Arc::new(Host::default());
+    let history = [
+        LifecycleState::Active,
+        LifecycleState::Active,
+        LifecycleState::Completed,
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(revision, state)| delivery(revision as u64, state))
+    .collect::<Vec<_>>();
+    *host.snapshot_history.lock().unwrap() = Some(history.clone());
+    host.replay_page_size.store(1, Ordering::Relaxed);
+    host.through.store(history.len(), Ordering::Relaxed);
+    let mut client = HarnessClient::connect(host, session()).await.unwrap();
+    let mut output = Vec::new();
+    assert_eq!(
+        run_headless(&mut client, command(), target(), &mut output)
+            .now_or_never()
+            .expect("finite pages need no external wakeup")
+            .unwrap(),
+        HeadlessOutcome::Completed
+    );
+    let delivered = frames(output)
+        .into_iter()
+        .filter_map(|frame| match frame.frame {
+            Some(wire::server_frame::Frame::Delivery(delivery)) => Some(delivery),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(delivered, history);
+    assert_eq!(client.session().resume().cursors[0].revision, 3);
+}
+
+#[tokio::test]
+async fn finite_replay_refreshes_when_a_later_status_advances_its_cut() {
+    for before_eof in [false, true] {
+        let host = Arc::new(Host::default());
+        *host.state.lock().unwrap() = Some(wire::CompletionState::Running);
+        *host.snapshot_history.lock().unwrap() = Some(Vec::new());
+        let final_delivery = delivery(0, LifecycleState::Completed);
+        let input = if before_eof {
+            let host = host.clone();
+            let final_delivery = final_delivery.clone();
+            futures::stream::once(async move {
+                host.snapshot_history
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .unwrap()
+                    .push(final_delivery);
+                host.through.store(1, Ordering::Relaxed);
+                host.complete(wire::CompletionState::Succeeded);
+                Ok(jsonl::client_frame(&wire::ClientFrame {
+                    frame: Some(wire::client_frame::Frame::Observe(target())),
+                })
+                .unwrap())
+            })
+            .chain(futures::stream::pending())
+            .boxed()
+        } else {
+            futures::stream::pending().boxed()
+        };
+        let mut client = HarnessClient::connect(host.clone(), session())
+            .await
+            .unwrap();
+        let mut output = Vec::new();
+        {
+            let mut runner = Box::pin(run_jsonl(&mut client, target(), input, &mut output));
+            if !before_eof {
+                assert!(runner.as_mut().now_or_never().is_none());
+                host.snapshot_history
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .unwrap()
+                    .push(final_delivery.clone());
+                host.through.store(1, Ordering::Relaxed);
+                host.complete(wire::CompletionState::Succeeded);
+            }
+            assert_eq!(
+                runner
+                    .as_mut()
+                    .now_or_never()
+                    .expect("a newer status must wake finite replay")
+                    .unwrap(),
+                HeadlessOutcome::Completed
+            );
+        }
+        let delivered = frames(output)
+            .into_iter()
+            .filter_map(|frame| match frame.frame {
+                Some(wire::server_frame::Frame::Delivery(delivery)) => Some(delivery),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(delivered, [final_delivery]);
+        assert_eq!(client.session().resume().cursors[0].revision, 1);
+    }
 }

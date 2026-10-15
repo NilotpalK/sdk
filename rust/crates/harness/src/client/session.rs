@@ -184,7 +184,6 @@ impl<S: ClientStateStore> ClientSession<S> {
             return Err(Error::Storage("delivery record missing".into()));
         };
         self.deliver(delivery, &record, true, before_commit)?;
-        self.compact_if_needed()?;
         match record.response.and_then(|response| response.frame) {
             Some(wire::server_frame::Frame::Delivery(delivery)) => Ok(delivery),
             _ => Err(Error::Storage("delivery record missing".into())),
@@ -321,7 +320,7 @@ impl<S: ClientStateStore> ClientSession<S> {
         Ok(())
     }
 
-    fn compact_if_needed(&mut self) -> Result<()> {
+    pub(super) fn compact_if_needed(&mut self) -> Result<()> {
         if self.tail_records >= 64 {
             self.checkpoint()?;
         }

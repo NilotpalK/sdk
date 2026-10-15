@@ -90,7 +90,7 @@ pub async fn run_headless<S: ClientStateStore>(
                 .is_some_and(|identity| identity.operation_id == target.operation_id);
             let state = admission.state;
             emit(output, wire::server_frame::Frame::Admission(admission))?;
-            if target_admission {
+            if target_admission || state == wire::AdmissionState::Indeterminate as i32 {
                 outcome = admission_outcome(state);
             }
             Ok(())
@@ -128,6 +128,9 @@ pub async fn run_jsonl<S: ClientStateStore>(
                 admitted = admission.state == wire::AdmissionState::Accepted as i32;
                 outcome = admission_outcome(admission.state);
             }
+            if admission.state == wire::AdmissionState::Indeterminate as i32 {
+                outcome = Some(HeadlessOutcome::Indeterminate);
+            }
             emit(output, wire::server_frame::Frame::Admission(admission))
         })
         .await?;
@@ -162,6 +165,7 @@ async fn follow<S: ClientStateStore>(
 ) -> Result<HeadlessOutcome> {
     let mut input_open = true;
     let mut replay_ended = false;
+    let mut replay_attempt = None;
     let mut status = None;
     let mut updates = subscribe(client, target, admitted).await?;
     loop {
@@ -210,6 +214,7 @@ async fn follow<S: ClientStateStore>(
                             // Admission invalidates a pre-submission snapshot even before EOF.
                             client.replay().await?;
                             replay_ended = false;
+                            replay_attempt = None;
                         }
                         wire::AdmissionState::Unspecified => {
                             return Err(Error::Conflict("unspecified admission".into()));
@@ -221,6 +226,7 @@ async fn follow<S: ClientStateStore>(
                 }
                 if resume {
                     replay_ended = false;
+                    replay_attempt = None;
                 }
             }
             Incoming::Command(None) => input_open = false,
@@ -235,7 +241,33 @@ async fn follow<S: ClientStateStore>(
                 None => replay_ended = true,
             },
         }
+        continue_replay(
+            client,
+            status.as_ref(),
+            &mut replay_ended,
+            &mut replay_attempt,
+        )
+        .await?;
     }
+}
+
+async fn continue_replay<S: ClientStateStore>(
+    client: &mut HarnessClient<S>,
+    status: Option<&wire::OperationStatus>,
+    ended: &mut bool,
+    attempt: &mut Option<(u64, u64)>,
+) -> Result<()> {
+    if *ended && let Some(status) = status {
+        let position = replay_position(client, status)?;
+        // A finite page may end before the observed cut. Retry only after cursor
+        // progress or a newer cut, never by repeatedly fetching the same empty page.
+        if position.0 < position.1 && *attempt != Some(position) {
+            *attempt = Some(position);
+            client.replay().await?;
+            *ended = false;
+        }
+    }
+    Ok(())
 }
 
 fn settlement<S: ClientStateStore>(
@@ -348,6 +380,14 @@ fn reached<S: ClientStateStore>(
     client: &HarnessClient<S>,
     status: &wire::OperationStatus,
 ) -> Result<bool> {
+    let (cursor, through) = replay_position(client, status)?;
+    Ok(cursor >= through)
+}
+
+fn replay_position<S: ClientStateStore>(
+    client: &HarnessClient<S>,
+    status: &wire::OperationStatus,
+) -> Result<(u64, u64)> {
     let through = status
         .replay_through
         .as_ref()
@@ -365,7 +405,7 @@ fn reached<S: ClientStateStore>(
             "operation replay boundary identity mismatch".into(),
         ));
     }
-    Ok(cursor.revision >= through.revision)
+    Ok((cursor.revision, through.revision))
 }
 
 async fn dispatch<S: ClientStateStore>(

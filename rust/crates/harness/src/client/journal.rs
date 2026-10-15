@@ -14,6 +14,7 @@ const HEADER_BYTES: usize = 68;
 /// File-backed cursor, projection and outbox recovery. Keep its directory private.
 pub struct FileClientState {
     file: File,
+    _lock: File,
     poisoned: bool,
     path: PathBuf,
 }
@@ -23,21 +24,21 @@ fn storage(error: impl std::fmt::Display) -> Error {
 }
 
 impl FileClientState {
-    /// Opens and exclusively locks one client journal. Different clients use different files.
+    /// Locks a stable sibling `.lock` file before opening the journal data.
+    /// Keep the lock file in place across checkpoint replacement and client exit.
     pub fn open(path: &Path) -> Result<Self> {
         let path = std::path::absolute(path).map_err(storage)?;
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let file = options.open(&path).map_err(storage)?;
-        file.try_lock()
+        let mut lock_path = path.as_os_str().to_owned();
+        lock_path.push(".lock");
+        let lock = open_file(Path::new(&lock_path))?;
+        lock.try_lock()
             .map_err(|error| Error::Conflict(format!("client journal is locked: {error}")))?;
+        // Open the data only after acquiring the stable lock: a paused opener must
+        // see the current inode after a checkpoint replaces the data file.
+        let file = open_file(&path)?;
         Ok(Self {
             file,
+            _lock: lock,
             poisoned: false,
             path,
         })
@@ -114,23 +115,33 @@ impl ClientStateStore for FileClientState {
         let mut temporary = self.path.as_os_str().to_owned();
         temporary.push(".checkpoint");
         let temporary = PathBuf::from(temporary);
-        let next = Self::open(&temporary)?;
-        next.file.set_len(0).map_err(storage)?;
-        let mut file = next.file;
+        let mut file = open_file(&temporary)?;
+        file.set_len(0).map_err(storage)?;
         file.write_all(&encode_record(checkpoint)?)
             .map_err(storage)?;
         file.sync_all().map_err(storage)?;
         std::fs::rename(&temporary, &self.path).map_err(storage)?;
         self.file = file;
         #[cfg(unix)]
-        if let Some(parent) = self.path.parent() {
-            if let Err(error) = File::open(parent).and_then(|directory| directory.sync_all()) {
-                self.poisoned = true;
-                return Err(storage(error));
-            }
+        if let Some(parent) = self.path.parent()
+            && let Err(error) = File::open(parent).and_then(|directory| directory.sync_all())
+        {
+            self.poisoned = true;
+            return Err(storage(error));
         }
         Ok(())
     }
+}
+
+fn open_file(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path).map_err(storage)
 }
 
 fn encode_record(record: &SessionRecord) -> Result<Vec<u8>> {

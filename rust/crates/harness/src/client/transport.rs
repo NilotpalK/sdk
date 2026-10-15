@@ -71,11 +71,29 @@ impl<S: ClientStateStore> HarnessClient<S> {
 
     /// Queues intent durably before sending it, preserving it after a lost response.
     pub async fn submit(&mut self, command: wire::CommandEnvelope) -> Result<wire::Admission> {
-        self.queue(command.clone())?;
-        let admission = self.api.submit(command).await?;
-        self.session.receive(wire::ServerFrame {
-            frame: Some(wire::server_frame::Frame::Admission(admission.clone())),
-        })?;
+        let operation_id = command
+            .operation
+            .as_ref()
+            .ok_or_else(|| Error::Invalid("command identity missing".into()))?
+            .operation_id
+            .clone();
+        self.queue(command)?;
+        let mut response = None;
+        self.drain_outbox(Some(&operation_id), |admission| {
+            response = Some(admission);
+            Ok(())
+        })
+        .await?;
+        let admission = response.ok_or_else(|| Error::Conflict("submission disappeared".into()))?;
+        let actual = admission
+            .operation
+            .as_ref()
+            .ok_or_else(|| Error::Conflict("admission identity missing".into()))?;
+        if actual.operation_id != operation_id {
+            return Err(Error::Indeterminate(crate::OperationId::parse(
+                &actual.operation_id,
+            )?));
+        }
         Ok(admission)
     }
 
@@ -84,14 +102,42 @@ impl<S: ClientStateStore> HarnessClient<S> {
         self.session.queue(command)
     }
 
-    /// Resubmits pending envelopes verbatim after a reconnect.
+    /// Resubmits pending envelopes in order, stopping after an indeterminate admission.
+    /// The callback receives every admission, including the one that stops draining.
     pub async fn flush_outbox(
         &mut self,
+        admitted: impl FnMut(wire::Admission) -> Result<()>,
+    ) -> Result<()> {
+        self.drain_outbox(None, admitted).await
+    }
+
+    async fn drain_outbox(
+        &mut self,
+        through: Option<&str>,
         mut admitted: impl FnMut(wire::Admission) -> Result<()>,
     ) -> Result<()> {
-        let pending = self.session.pending().cloned().collect::<Vec<_>>();
+        let mut pending = Vec::new();
+        for command in self.session.pending() {
+            pending.push(command.clone());
+            if through.is_some_and(|id| {
+                command
+                    .operation
+                    .as_ref()
+                    .is_some_and(|op| op.operation_id == id)
+            }) {
+                break;
+            }
+        }
         for command in pending {
-            admitted(self.submit(command).await?)?;
+            let admission = self.api.submit(command).await?;
+            self.session.receive(wire::ServerFrame {
+                frame: Some(wire::server_frame::Frame::Admission(admission.clone())),
+            })?;
+            let blocked = admission.state == wire::AdmissionState::Indeterminate as i32;
+            admitted(admission)?;
+            if blocked {
+                break;
+            }
         }
         Ok(())
     }
@@ -131,6 +177,8 @@ impl<S: ClientStateStore> HarnessClient<S> {
         before_commit: impl FnOnce(&wire::ServerFrame) -> Result<()>,
     ) -> Result<wire::Delivery> {
         self.buffered_delivery = Some(self.session.receive_delivery(delivery, before_commit)?);
+        // Maintenance can fail after append; retain the committed frame before it runs.
+        self.session.compact_if_needed()?;
         if let Some(delivery) = self.buffered_delivery.as_ref() {
             self.api
                 .acknowledge(wire::Acknowledge {

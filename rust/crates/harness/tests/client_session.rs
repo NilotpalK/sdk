@@ -237,6 +237,7 @@ struct Host {
     live_sender: Mutex<Option<futures::channel::mpsc::UnboundedSender<Result<wire::Delivery>>>>,
     submit_delivery: Mutex<Option<wire::Delivery>>,
     snapshot_history: Mutex<Option<Vec<wire::Delivery>>>,
+    replay_page_size: AtomicUsize,
     status_sender: Mutex<
         Option<(
             wire::ObserveRequest,
@@ -244,6 +245,7 @@ struct Host {
         )>,
     >,
     requires_admission: AtomicBool,
+    admission_state: Mutex<Option<wire::AdmissionState>>,
     ack_input_eof: Mutex<Option<futures::channel::oneshot::Sender<()>>>,
     ack_release: Mutex<Option<futures::channel::oneshot::Receiver<()>>>,
 }
@@ -351,7 +353,13 @@ impl HarnessWireApi for Host {
                 }
                 self.complete(wire::CompletionState::Succeeded);
             }
-            Ok(admission(&command, wire::AdmissionState::Accepted))
+            Ok(admission(
+                &command,
+                self.admission_state
+                    .lock()
+                    .unwrap()
+                    .unwrap_or(wire::AdmissionState::Accepted),
+            ))
         })
     }
     fn replay(
@@ -365,6 +373,10 @@ impl HarnessWireApi for Host {
                 let frames = history
                     .iter()
                     .filter(|delivery| delivery.through_revision > after)
+                    .take(match self.replay_page_size.load(Ordering::Relaxed) {
+                        0 => usize::MAX,
+                        size => size,
+                    })
                     .cloned()
                     .map(Ok)
                     .collect::<Vec<_>>();
@@ -622,3 +634,6 @@ fn streaming_views_share_tool_identity_and_keep_provider_usage() {
 
 #[path = "client_session_headless.rs"]
 mod headless;
+
+#[path = "client_session_recovery.rs"]
+mod recovery;

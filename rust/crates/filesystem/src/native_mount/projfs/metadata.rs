@@ -108,77 +108,40 @@ fn query_metadata(
     path: &[u16],
     work: &mut &crate::NativeMaterializationWork,
 ) -> Result<Option<crate::native_host::HostStat>, crate::NativeTreeMaterializationError> {
-    use std::os::windows::io::AsRawHandle as _;
-    use windows::{Wdk::Storage::FileSystem as nt, Win32::Foundation as win};
+    NativeHostWork::check(work)?;
+    // Only leaf names use the query. Parent traversal retains the held-handle
+    // validator, including its rejection of every reparse-tagged directory.
     let (Ok(length), Ok(volume)) = (
         u16::try_from(path.len().saturating_mul(2)),
         u32::try_from(root.identity().device),
     ) else {
         return Ok(None);
     };
-    // Keep the existing held-handle path for root, malformed and reparse names.
-    if path.is_empty() {
+    if matches!(path, [] | [46] | [46, 46])
+        || path.iter().any(|unit| matches!(unit, 0 | 47 | 58 | 92))
+    {
         return Ok(None);
     }
-    for (index, part) in path.split(|unit| *unit == 92).enumerate() {
-        if index != 0 {
-            work.started_io(crate::materializer::NativeResourceCredit::Items.delta(1))?;
-        }
-        if matches!(part, [] | [46] | [46, 46]) {
-            return Ok(None);
-        }
-        for unit in part {
-            work.started_io(crate::materializer::NativeResourceCredit::Items.delta(1))?;
-            if matches!(unit, 0 | 47 | 58) {
-                return Ok(None);
-            }
-        }
-    }
-    let name = win::UNICODE_STRING {
+    let charge = crate::WorkCounters {
+        items_examined: path.len() as u64,
+        backend_read_operations: 1,
+        ..crate::WorkCounters::UNCHARGED
+    };
+    // Admit before I/O. Commit the fast-path charge only when it supplies the
+    // result; otherwise the original stat path performs its own charging.
+    let credit = work.reserve_work(charge)?;
+    let name = windows::Win32::Foundation::UNICODE_STRING {
         Length: length,
         MaximumLength: length,
         Buffer: windows::core::PWSTR(path.as_ptr().cast_mut()),
     };
-    let attributes = windows::Wdk::Foundation::OBJECT_ATTRIBUTES {
-        Length: size_of::<windows::Wdk::Foundation::OBJECT_ATTRIBUTES>() as u32,
-        RootDirectory: win::HANDLE(root.directory_handle().as_raw_handle()),
-        ObjectName: &name,
-        Attributes: win::OBJ_CASE_INSENSITIVE | win::OBJ_DONT_REPARSE,
-        ..Default::default()
-    };
-    let mut block = windows::Win32::System::IO::IO_STATUS_BLOCK::default();
-    let mut metadata = nt::FILE_STAT_INFORMATION::default();
-    work.started_io(ReadOperations.delta(1))?;
-    // SAFETY: the held root, relative name and fixed-size outputs remain live.
-    // OBJ_DONT_REPARSE refuses links in every component, including the leaf.
-    let status = unsafe {
-        nt::NtQueryInformationByName(
-            &attributes,
-            &mut block,
-            (&raw mut metadata).cast(),
-            size_of::<nt::FILE_STAT_INFORMATION>() as u32,
-            nt::FileStatInformation,
-        )
-    };
-    if status.is_err() || metadata.ReparseTag != 0 {
-        return Ok(None);
+    match crate::native_host::stat_windows_name(&root.directory, &name, volume, true) {
+        Ok(Some(metadata)) => {
+            credit.record_completed(credit.remaining_work())?;
+            Ok(Some(metadata))
+        }
+        Ok(None) | Err(_) => Ok(None),
     }
-    // Keep HostStat's checks on fields not retained by the callback, too.
-    if [
-        metadata.EndOfFile,
-        metadata.CreationTime,
-        metadata.LastAccessTime,
-        metadata.LastWriteTime,
-    ]
-    .into_iter()
-    .any(|value| value < 0)
-    {
-        return Ok(None);
-    }
-    Ok(Some(crate::native_host::HostStat {
-        raw: metadata,
-        volume_serial_number: volume,
-    }))
 }
 
 pub(super) fn host_relative_path(path: &MountPath) -> Result<PathBuf, MountSourceError> {

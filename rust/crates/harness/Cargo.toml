@@ -18,6 +18,11 @@ name = "main"
 path = "tests/main.rs"
 
 [[test]]
+name = "context-discovery"
+path = "tests/context_discovery.rs"
+required-features = ["filesystem"]
+
+[[test]]
 name = "client_session"
 path = "tests/client_session.rs"
 
@@ -52,6 +57,7 @@ name = "client_demand"
 harness = false
 
 [features]
+test-support = []
 browser = ["wasm", "filesystem", "acyclic-fs/browser"]
 # Native presentation only; this does not select providers or grant authority.
 terminal = ["dep:hex"]
@@ -120,6 +126,9 @@ proptest.workspace = true
 acyclic-stream = { version = "=0.2.0", path = "../stream" }
 tempfile = "3.27.0"
 tokio.workspace = true
+
+[dev-dependencies]
+acyclic-harness = { version = "=0.2.0", path = ".", features = ["test-support"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # Rust SDK execution uses the real browser event loop even without exports.

@@ -371,7 +371,10 @@ impl<S: ClientStateStore> ClientSession<S> {
         if persist {
             self.append_record(record)?;
         }
-        self.pending[index] = None;
+        *self
+            .pending
+            .get_mut(index)
+            .ok_or_else(|| Error::Conflict("pending command disappeared".into()))? = None;
         self.operations.remove(&operation.operation_id);
         self.idempotency.remove(&key);
         if self.operations.is_empty() {

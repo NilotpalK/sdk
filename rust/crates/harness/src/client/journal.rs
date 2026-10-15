@@ -148,7 +148,14 @@ fn encode_record(record: &SessionRecord) -> Result<Vec<u8>> {
         .get_mut(4..36)
         .ok_or_else(|| storage("journal header missing"))?
         .copy_from_slice(digest.as_bytes());
-    let header_digest = blake3::hash(&bytes[..36]);
-    bytes[36..HEADER_BYTES].copy_from_slice(header_digest.as_bytes());
+    let header_digest = blake3::hash(
+        bytes
+            .get(..36)
+            .ok_or_else(|| storage("journal header missing"))?,
+    );
+    bytes
+        .get_mut(36..HEADER_BYTES)
+        .ok_or_else(|| storage("journal header checksum missing"))?
+        .copy_from_slice(header_digest.as_bytes());
     Ok(bytes)
 }

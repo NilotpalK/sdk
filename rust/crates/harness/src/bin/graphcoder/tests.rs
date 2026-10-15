@@ -14,6 +14,9 @@ struct Probe {
 }
 
 impl HarnessWireApi for Probe {
+    fn acknowledge<'a>(&'a self, _: wire::Acknowledge) -> BoxProviderFuture<'a, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
     fn handshake<'a>(
         &'a self,
         request: wire::HandshakeRequest,

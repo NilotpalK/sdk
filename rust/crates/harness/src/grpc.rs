@@ -222,6 +222,12 @@ mod tests {
     struct FakeApi;
 
     impl HarnessWireApi for FakeApi {
+        fn acknowledge<'a>(
+            &'a self,
+            _: wire::Acknowledge,
+        ) -> futures::future::BoxFuture<'a, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
         fn authorize_operation_control<'a>(
             &'a self,
             _: &'a crate::wire_api::OperationControlRequest,

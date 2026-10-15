@@ -88,7 +88,7 @@ fn replay_recovers_projection_and_cursor_and_deduplicates() {
     let ack = session.receive(first.clone()).unwrap().unwrap();
     assert_eq!(ack.through_revision, 1);
     session.receive(first).unwrap();
-    assert_eq!(session.into_store().0.len(), 2);
+    assert_eq!(session.into_store().load().unwrap().len(), 2);
     let mut original = self::session();
     original
         .receive(frame(delivery(0, LifecycleState::Completed)))
@@ -98,7 +98,7 @@ fn replay_recovers_projection_and_cursor_and_deduplicates() {
     assert_eq!(recovered.views(), &views);
     assert_eq!(recovered.resume().cursors[0].revision, 1);
     assert_eq!(
-        recovered.views().tasks["5:task"].status,
+        recovered.views().tasks["AGGREGATE_KIND_TASK:task"].status,
         LifecycleState::Completed
     );
 }
@@ -128,7 +128,7 @@ fn invalid_deliveries_never_advance_or_publish() {
     }
     assert_eq!(session.resume().cursors[0].revision, 0);
     assert!(session.views().tasks.is_empty());
-    assert_eq!(session.into_store().0.len(), 1);
+    assert_eq!(session.into_store().load().unwrap().len(), 1);
 }
 
 struct FailingStore {
@@ -144,6 +144,12 @@ impl ClientStateStore for FailingStore {
             return Err(Error::Storage("disk full".into()));
         }
         self.inner.append(record)
+    }
+    fn replace(&mut self, record: &SessionRecord) -> Result<()> {
+        if self.fail.load(Ordering::Relaxed) {
+            return Err(Error::Storage("disk full".into()));
+        }
+        self.inner.replace(record)
     }
 }
 
@@ -219,9 +225,34 @@ fn outbox_identity_conflicts_and_admission_are_exact() {
 struct Host {
     commands: Mutex<Vec<wire::CommandEnvelope>>,
     lost_reply: AtomicBool,
+    fail_submit: AtomicUsize,
     resumes: Mutex<Vec<wire::ResumeRequest>>,
+    acknowledgements: Mutex<Vec<wire::ClientFrame>>,
+    lost_ack: AtomicBool,
+    hold_ack: AtomicBool,
+    trace: Mutex<Option<BoxProviderStream<'static, Result<wire::Delivery>>>>,
+    state: Mutex<Option<wire::CompletionState>>,
+    live_sender: Mutex<Option<futures::channel::mpsc::UnboundedSender<Result<wire::Delivery>>>>,
+    submit_delivery: Mutex<Option<wire::Delivery>>,
 }
 impl HarnessWireApi for Host {
+    fn acknowledge(&self, request: wire::Acknowledge) -> BoxProviderFuture<'_, Result<()>> {
+        Box::pin(async move {
+            if self.hold_ack.load(Ordering::Relaxed) {
+                std::future::pending::<()>().await;
+            }
+            self.acknowledgements
+                .lock()
+                .unwrap()
+                .push(wire::ClientFrame {
+                    frame: Some(wire::client_frame::Frame::Acknowledge(request)),
+                });
+            if self.lost_ack.swap(false, Ordering::Relaxed) {
+                return Err(Error::Storage("lost acknowledgement".into()));
+            }
+            Ok(())
+        })
+    }
     fn handshake(
         &self,
         request: wire::HandshakeRequest,
@@ -234,8 +265,19 @@ impl HarnessWireApi for Host {
     ) -> BoxProviderFuture<'_, Result<wire::Admission>> {
         Box::pin(async move {
             self.commands.lock().unwrap().push(command.clone());
-            if self.lost_reply.swap(false, Ordering::Relaxed) {
+            if self.lost_reply.swap(false, Ordering::Relaxed)
+                || self.commands.lock().unwrap().len() == self.fail_submit.load(Ordering::Relaxed)
+            {
                 return Err(Error::Storage("connection lost after admission".into()));
+            }
+            if let Some(delivery) = self.submit_delivery.lock().unwrap().take() {
+                self.live_sender
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .unbounded_send(Ok(delivery))
+                    .unwrap();
             }
             Ok(admission(&command, wire::AdmissionState::Accepted))
         })
@@ -247,6 +289,9 @@ impl HarnessWireApi for Host {
         Box::pin(async move {
             let after = request.cursors[0].revision;
             self.resumes.lock().unwrap().push(request);
+            if let Some(trace) = self.trace.lock().unwrap().take() {
+                return Ok(trace);
+            }
             Ok(Box::pin(futures::stream::iter(
                 (after..2).map(|revision| Ok(delivery(revision, LifecycleState::Completed))),
             ))
@@ -271,16 +316,42 @@ impl HarnessWireApi for Host {
                     operation_id: request.operation_id,
                     idempotency_key: String::new(),
                 }),
-                state: wire::CompletionState::Succeeded as i32,
+                state: self
+                    .state
+                    .lock()
+                    .unwrap()
+                    .unwrap_or(wire::CompletionState::Succeeded) as i32,
                 ..Default::default()
             })
         })
     }
     fn cancel(
         &self,
-        _: wire::CancelRequest,
+        request: wire::CancelRequest,
     ) -> BoxProviderFuture<'_, Result<wire::CancelResponse>> {
-        Box::pin(async { Err(Error::Unsupported("not used".into())) })
+        Box::pin(async move {
+            *self.state.lock().unwrap() = Some(wire::CompletionState::Cancelled);
+            if let Some(sender) = self.live_sender.lock().unwrap().as_ref() {
+                sender
+                    .unbounded_send(Ok(delivery(0, LifecycleState::Cancelled)))
+                    .unwrap();
+            }
+            let status = self
+                .observe(wire::ObserveRequest {
+                    operation_id: request.operation_id.clone(),
+                    owner: request.owner,
+                    protocol: request.protocol,
+                    scope: request.scope,
+                })
+                .await?;
+            Ok(wire::CancelResponse {
+                status: Some(status),
+                operation: Some(wire::OperationIdentity {
+                    operation_id: request.operation_id,
+                    idempotency_key: request.idempotency_key,
+                }),
+            })
+        })
     }
 }
 
@@ -298,7 +369,15 @@ async fn reconnect_resends_verbatim_and_resumes_the_committed_cut() {
     let mut client = HarnessClient::connect(host.clone(), recovered)
         .await
         .unwrap();
-    assert_eq!(client.flush_outbox().await.unwrap().len(), 1);
+    let mut admissions = Vec::new();
+    client
+        .flush_outbox(|admission| {
+            admissions.push(admission);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(admissions.len(), 1);
     assert_eq!(
         *host.commands.lock().unwrap(),
         vec![command.clone(), command]
@@ -392,39 +471,68 @@ fn canonical_jsonl_golden_frames() {
 fn streaming_views_share_tool_identity_and_keep_provider_usage() {
     use acyclic_harness::{client::ClientViews, model::ModelEvent};
     let mut views = ClientViews::default();
-    views.model_event(
-        &owner(),
-        ModelEvent::Content {
-            delta: "hel".into(),
-        },
-    );
-    views.model_event(&owner(), ModelEvent::Content { delta: "lo".into() });
-    views.model_event(
-        &owner(),
-        ModelEvent::Reasoning {
-            delta: "thinking".into(),
-        },
-    );
+    views
+        .model_event(
+            &owner(),
+            ModelEvent::Content {
+                delta: "hel".into(),
+            },
+        )
+        .unwrap();
+    views
+        .model_event(&owner(), ModelEvent::Content { delta: "lo".into() })
+        .unwrap();
+    views
+        .model_event(
+            &owner(),
+            ModelEvent::Reasoning {
+                delta: "thinking".into(),
+            },
+        )
+        .unwrap();
     views.tool_output(&owner(), "call", "first\n");
-    views.model_event(
-        &owner(),
-        ModelEvent::ToolCall {
-            call_id: "call".into(),
-            name: "bash".into(),
-            arguments: serde_json::json!({"command":"pwd"}),
-        },
-    );
+    views
+        .model_event(
+            &owner(),
+            ModelEvent::ToolCall {
+                call_id: "call".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({"command":"pwd"}),
+            },
+        )
+        .unwrap();
     views.tool_output(&owner(), "call", "second\n");
     let usage = serde_json::json!({"input_tokens":12,"output_tokens":2});
-    views.model_event(
-        &owner(),
-        ModelEvent::Completed {
-            metadata: usage.clone(),
-        },
+    views
+        .model_event(
+            &owner(),
+            ModelEvent::Completed {
+                metadata: usage.clone(),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        views.transcripts["AGGREGATE_KIND_TASK:task"].streaming_text,
+        "hello"
     );
-    assert_eq!(views.transcripts["5:task"].streaming_text, "hello");
-    assert_eq!(views.transcripts["5:task"].reasoning, "thinking");
-    assert_eq!(views.tools["5:task"]["call"].output, "first\nsecond\n");
-    assert_eq!(views.tools["5:task"]["call"].name, "bash");
-    assert_eq!(views.usage["5:task"], usage);
+    assert_eq!(
+        views.transcripts["AGGREGATE_KIND_TASK:task"].reasoning,
+        "thinking"
+    );
+    assert_eq!(
+        views.tools["AGGREGATE_KIND_TASK:task"]["call"].output,
+        "first\nsecond\n"
+    );
+    assert_eq!(views.tools["AGGREGATE_KIND_TASK:task"]["call"].name, "bash");
+    assert_eq!(views.usage["AGGREGATE_KIND_TASK:task"], usage);
+    views
+        .model_event(&owner(), ModelEvent::Completed { metadata: usage })
+        .unwrap();
+    assert_eq!(
+        views.usage["AGGREGATE_KIND_TASK:task"],
+        serde_json::json!({"input_tokens":24,"output_tokens":4})
+    );
 }
+
+#[path = "client_session_headless.rs"]
+mod headless;

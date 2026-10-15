@@ -1,0 +1,149 @@
+//! Single-writer, checksummed private client journal.
+
+use super::{ClientStateStore, SessionRecord};
+use crate::{Error, Result};
+use prost::Message;
+use std::{
+    fs::{File, OpenOptions},
+    io::{Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
+};
+
+/// File-backed cursor, projection and outbox recovery. Keep its directory private.
+pub struct FileClientState {
+    file: File,
+    poisoned: bool,
+    path: PathBuf,
+}
+
+fn storage(error: impl std::fmt::Display) -> Error {
+    Error::Storage(error.to_string())
+}
+
+impl FileClientState {
+    /// Opens and exclusively locks one client journal. Different clients use different files.
+    pub fn open(path: &Path) -> Result<Self> {
+        let path = std::path::absolute(path).map_err(storage)?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(&path).map_err(storage)?;
+        file.try_lock()
+            .map_err(|error| Error::Conflict(format!("client journal is locked: {error}")))?;
+        Ok(Self {
+            file,
+            poisoned: false,
+            path,
+        })
+    }
+
+    fn check(&self) -> Result<()> {
+        if self.poisoned {
+            return Err(Error::Storage(
+                "client journal needs reopening after an I/O failure".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn truncate(&mut self, length: u64) -> Result<()> {
+        self.file.set_len(length).map_err(storage)?;
+        self.file.seek(SeekFrom::Start(length)).map_err(storage)?;
+        self.file.sync_data().map_err(storage)
+    }
+}
+
+impl ClientStateStore for FileClientState {
+    fn load(&mut self) -> Result<Vec<SessionRecord>> {
+        self.check()?;
+        self.file.seek(SeekFrom::Start(0)).map_err(storage)?;
+        let length = self.file.metadata().map_err(storage)?.len();
+        let mut offset = 0;
+        let mut records = Vec::new();
+        while offset < length {
+            if length - offset < 36 {
+                self.truncate(offset)?;
+                break;
+            }
+            let mut size = [0; 4];
+            let mut digest = [0; 32];
+            self.file.read_exact(&mut size).map_err(storage)?;
+            self.file.read_exact(&mut digest).map_err(storage)?;
+            let size = u32::from_le_bytes(size);
+            if u64::from(size) > length - offset - 36 {
+                self.truncate(offset)?;
+                break;
+            }
+            let mut bytes = vec![0; size as usize];
+            self.file.read_exact(&mut bytes).map_err(storage)?;
+            if blake3::hash(&bytes).as_bytes() != &digest {
+                return Err(Error::Storage("client journal checksum mismatch".into()));
+            }
+            records.push(SessionRecord::decode(bytes.as_slice()).map_err(storage)?);
+            offset += 36 + u64::from(size);
+        }
+        Ok(records)
+    }
+
+    fn append(&mut self, record: &SessionRecord) -> Result<()> {
+        self.check()?;
+        let bytes = encode_record(record)?;
+        let start = self.file.seek(SeekFrom::End(0)).map_err(storage)?;
+        if let Err(error) = self
+            .file
+            .write_all(&bytes)
+            .and_then(|()| self.file.sync_data())
+        {
+            if self.truncate(start).is_err() {
+                self.poisoned = true;
+            }
+            return Err(storage(error));
+        }
+        Ok(())
+    }
+
+    fn replace(&mut self, checkpoint: &SessionRecord) -> Result<()> {
+        self.check()?;
+        let mut temporary = self.path.as_os_str().to_owned();
+        temporary.push(".checkpoint");
+        let temporary = PathBuf::from(temporary);
+        let next = Self::open(&temporary)?;
+        next.file.set_len(0).map_err(storage)?;
+        let mut file = next.file;
+        file.write_all(&encode_record(checkpoint)?)
+            .map_err(storage)?;
+        file.sync_all().map_err(storage)?;
+        std::fs::rename(&temporary, &self.path).map_err(storage)?;
+        self.file = file;
+        #[cfg(unix)]
+        if let Some(parent) = self.path.parent() {
+            if let Err(error) = File::open(parent).and_then(|directory| directory.sync_all()) {
+                self.poisoned = true;
+                return Err(storage(error));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn encode_record(record: &SessionRecord) -> Result<Vec<u8>> {
+    let length = u32::try_from(record.encoded_len()).map_err(storage)?;
+    let mut bytes = Vec::with_capacity(36 + length as usize);
+    bytes.extend_from_slice(&length.to_le_bytes());
+    bytes.resize(36, 0);
+    record.encode(&mut bytes).map_err(storage)?;
+    let digest = blake3::hash(
+        bytes
+            .get(36..)
+            .ok_or_else(|| storage("journal encoding failed"))?,
+    );
+    bytes
+        .get_mut(4..36)
+        .ok_or_else(|| storage("journal header missing"))?
+        .copy_from_slice(digest.as_bytes());
+    Ok(bytes)
+}

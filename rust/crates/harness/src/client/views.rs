@@ -62,7 +62,9 @@ pub struct ClientViews {
 }
 
 pub(super) fn authority_key(authority: &wire::Authority) -> String {
-    format!("{}:{}", authority.kind, authority.id)
+    let kind = wire::AggregateKind::try_from(authority.kind)
+        .map_or("AGGREGATE_KIND_UNSPECIFIED", |kind| kind.as_str_name());
+    format!("{kind}:{}", authority.id)
 }
 
 impl ClientViews {
@@ -113,7 +115,7 @@ impl ClientViews {
     }
 
     /// Adds a model stream event to the same state that committed replay updates.
-    pub fn model_event(&mut self, authority: &wire::Authority, event: ModelEvent) {
+    pub fn model_event(&mut self, authority: &wire::Authority, event: ModelEvent) -> Result<()> {
         let key = authority_key(authority);
         match event {
             ModelEvent::Content { delta } => self
@@ -143,9 +145,13 @@ impl ClientViews {
                 tool.arguments = arguments;
             }
             ModelEvent::Completed { metadata } => {
-                self.usage.insert(key, metadata);
+                accumulate_usage(
+                    self.usage.entry(key).or_insert(serde_json::Value::Null),
+                    metadata,
+                )?;
             }
         }
+        Ok(())
     }
 
     /// Appends output without requiring a renderer to maintain a second tool registry.
@@ -158,6 +164,34 @@ impl ClientViews {
             .output
             .push_str(delta);
     }
+}
+
+fn accumulate_usage(total: &mut serde_json::Value, step: serde_json::Value) -> Result<()> {
+    use serde_json::Value;
+    let overflow = || crate::Error::Invalid("usage counter overflow".into());
+    match (total, step) {
+        (Value::Object(total), Value::Object(step)) => {
+            for (key, value) in step {
+                accumulate_usage(total.entry(key).or_insert(Value::Null), value)?;
+            }
+        }
+        (Value::Number(total), Value::Number(step)) => {
+            *total = if let (Some(left), Some(right)) = (total.as_u64(), step.as_u64()) {
+                left.checked_add(right).ok_or_else(overflow)?.into()
+            } else if let (Some(left), Some(right)) = (total.as_i64(), step.as_i64()) {
+                left.checked_add(right).ok_or_else(overflow)?.into()
+            } else {
+                serde_json::Number::from_f64(
+                    total.as_f64().ok_or_else(overflow)? + step.as_f64().ok_or_else(overflow)?,
+                )
+                .ok_or_else(overflow)?
+            };
+        }
+        (total, step) => {
+            *total = step;
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn payload(event: &wire::EventEnvelope) -> Result<EventPayload> {

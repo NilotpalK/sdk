@@ -73,6 +73,19 @@ impl NativeSession {
     }
 }
 impl HarnessWireApi for NativeSession {
+    fn acknowledge<'a>(&'a self, request: wire::Acknowledge) -> BoxProviderFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let authority = request
+                .authority
+                .as_ref()
+                .ok_or_else(|| Error::Invalid("acknowledgement authority missing".into()))?;
+            self.binding(authority)?;
+            if request.generation != self.config.generation {
+                return Err(Error::Conflict("acknowledgement generation changed".into()));
+            }
+            Ok(())
+        })
+    }
     fn handshake<'a>(
         &'a self,
         request: wire::HandshakeRequest,

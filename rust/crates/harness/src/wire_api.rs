@@ -35,6 +35,9 @@ pub trait HarnessWireApi: acyclic_stream::ProviderPlatform + 'static {
         request: wire::ResumeRequest,
     ) -> BoxFuture<'a, Result<BoxStream<'static, Result<wire::Delivery>>>>;
 
+    /// Sends `ClientFrame::Acknowledge` after the client's durable replay commit.
+    fn acknowledge<'a>(&'a self, request: wire::Acknowledge) -> BoxFuture<'a, Result<()>>;
+
     /// Authenticates one decoded operation-control scope against host-held trust roots.
     fn authorize_operation_control<'a>(
         &'a self,

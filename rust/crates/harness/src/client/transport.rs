@@ -36,8 +36,10 @@ pub async fn connect_or_spawn<S: ClientStateStore>(
 /// Thin transport runner; Rust owns retry identities, replay and projection recovery.
 pub struct HarnessClient<S> {
     api: Arc<dyn HarnessWireApi>,
+    handshake: wire::HandshakeResponse,
     session: ClientSession<S>,
     deliveries: Option<BoxProviderStream<'static, Result<wire::Delivery>>>,
+    buffered_delivery: Option<wire::Delivery>,
 }
 
 impl<S: ClientStateStore> HarnessClient<S> {
@@ -60,14 +62,16 @@ impl<S: ClientStateStore> HarnessClient<S> {
         }
         Ok(Self {
             api,
+            handshake: response,
             session,
             deliveries: None,
+            buffered_delivery: None,
         })
     }
 
     /// Queues intent durably before sending it, preserving it after a lost response.
     pub async fn submit(&mut self, command: wire::CommandEnvelope) -> Result<wire::Admission> {
-        self.session.queue(command.clone())?;
+        self.queue(command.clone())?;
         let admission = self.api.submit(command).await?;
         self.session.receive(wire::ServerFrame {
             frame: Some(wire::server_frame::Frame::Admission(admission.clone())),
@@ -75,14 +79,21 @@ impl<S: ClientStateStore> HarnessClient<S> {
         Ok(admission)
     }
 
+    /// Queues a command without starting I/O, for offline use or ordered flushing.
+    pub fn queue(&mut self, command: wire::CommandEnvelope) -> Result<()> {
+        self.session.queue(command)
+    }
+
     /// Resubmits pending envelopes verbatim after a reconnect.
-    pub async fn flush_outbox(&mut self) -> Result<Vec<wire::Admission>> {
+    pub async fn flush_outbox(
+        &mut self,
+        mut admitted: impl FnMut(wire::Admission) -> Result<()>,
+    ) -> Result<()> {
         let pending = self.session.pending().cloned().collect::<Vec<_>>();
-        let mut admissions = Vec::with_capacity(pending.len());
         for command in pending {
-            admissions.push(self.submit(command).await?);
+            admitted(self.submit(command).await?)?;
         }
-        Ok(admissions)
+        Ok(())
     }
 
     /// Opens a replay/follow stream at the durable cut. No sleeps or polling.
@@ -93,18 +104,30 @@ impl<S: ClientStateStore> HarnessClient<S> {
 
     /// Validates and durably publishes the next complete delivery.
     pub async fn next_delivery(&mut self) -> Result<Option<wire::Delivery>> {
-        let stream = self
-            .deliveries
-            .as_mut()
-            .ok_or_else(|| Error::Invalid("open replay before reading deliveries".into()))?;
-        let Some(delivery) = stream.next().await else {
-            return Ok(None);
-        };
-        let delivery = delivery?;
-        self.session.receive(wire::ServerFrame {
-            frame: Some(wire::server_frame::Frame::Delivery(delivery.clone())),
-        })?;
-        Ok(Some(delivery))
+        if self.buffered_delivery.is_none() {
+            let stream = self
+                .deliveries
+                .as_mut()
+                .ok_or_else(|| Error::Invalid("open replay before reading deliveries".into()))?;
+            let Some(delivery) = stream.next().await else {
+                return Ok(None);
+            };
+            let delivery = delivery?;
+            self.session.receive(wire::ServerFrame {
+                frame: Some(wire::server_frame::Frame::Delivery(delivery.clone())),
+            })?;
+            self.buffered_delivery = Some(delivery);
+        }
+        if let Some(delivery) = self.buffered_delivery.as_ref() {
+            self.api
+                .acknowledge(wire::Acknowledge {
+                    authority: delivery.authority.clone(),
+                    generation: delivery.generation.clone(),
+                    through_revision: delivery.through_revision,
+                })
+                .await?;
+        }
+        Ok(self.buffered_delivery.take())
     }
 
     /// Observes an identity-bound operation projection.
@@ -126,6 +149,16 @@ impl<S: ClientStateStore> HarnessClient<S> {
     /// Shared renderer state and outbox.
     pub fn session(&self) -> &ClientSession<S> {
         &self.session
+    }
+
+    /// Negotiated service response, also emitted by JSONL runners.
+    pub fn handshake(&self) -> &wire::HandshakeResponse {
+        &self.handshake
+    }
+
+    /// Tracks a new aggregate without changing an existing durable replay cut.
+    pub fn track(&mut self, cursor: wire::ReplayCursor) -> Result<()> {
+        self.session.track(cursor)
     }
 
     /// Consumes the transport while retaining durable state for reconnect.

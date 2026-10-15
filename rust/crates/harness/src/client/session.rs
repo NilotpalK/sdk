@@ -19,6 +19,26 @@ pub struct SessionRecord {
     /// One validated admission or delivery.
     #[prost(message, optional, tag = "2")]
     pub response: Option<wire::ServerFrame>,
+    /// Complete recovery cut replacing the older journal prefix.
+    #[prost(message, optional, tag = "3")]
+    pub checkpoint: Option<SessionCheckpoint>,
+}
+
+/// Version-bound local projection, cursor and pending command recovery cut.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct SessionCheckpoint {
+    /// Protocol identity that produced this state.
+    #[prost(message, optional, tag = "1")]
+    pub protocol: Option<wire::ProtocolIdentity>,
+    /// Durable per-authority cuts.
+    #[prost(message, repeated, tag = "2")]
+    pub cursors: Vec<wire::ReplayCursor>,
+    /// Exact pending envelopes in submission order.
+    #[prost(message, repeated, tag = "3")]
+    pub pending: Vec<wire::CommandEnvelope>,
+    /// The same renderer state paired with these cursors.
+    #[prost(bytes = "vec", tag = "4")]
+    pub views_json: Vec<u8>,
 }
 
 /// Private, single-writer durable journal. A failed append must leave no record.
@@ -27,18 +47,27 @@ pub trait ClientStateStore {
     fn load(&mut self) -> Result<Vec<SessionRecord>>;
     /// Atomically commits one record before returning success.
     fn append(&mut self, record: &SessionRecord) -> Result<()>;
+    /// Atomically replaces the journal with one complete checkpoint.
+    fn replace(&mut self, checkpoint: &SessionRecord) -> Result<()>;
 }
 
 /// In-process store for embedded consumers and tests.
 #[derive(Default)]
-pub struct MemoryClientState(pub Vec<SessionRecord>);
+pub struct MemoryClientState {
+    records: Vec<SessionRecord>,
+}
 
 impl ClientStateStore for MemoryClientState {
     fn load(&mut self) -> Result<Vec<SessionRecord>> {
-        Ok(self.0.clone())
+        Ok(self.records.clone())
     }
     fn append(&mut self, record: &SessionRecord) -> Result<()> {
-        self.0.push(record.clone());
+        self.records.push(record.clone());
+        Ok(())
+    }
+    fn replace(&mut self, checkpoint: &SessionRecord) -> Result<()> {
+        self.records.clear();
+        self.records.push(checkpoint.clone());
         Ok(())
     }
 }
@@ -49,6 +78,7 @@ pub struct ClientSession<S> {
     cursors: BTreeMap<String, wire::ReplayCursor>,
     pending: Vec<wire::CommandEnvelope>,
     views: ClientViews,
+    tail_records: usize,
 }
 
 impl<S: ClientStateStore> ClientSession<S> {
@@ -60,9 +90,18 @@ impl<S: ClientStateStore> ClientSession<S> {
             cursors: BTreeMap::new(),
             pending: Vec::new(),
             views: ClientViews::default(),
+            tail_records: 0,
         };
         for record in records {
-            session.record(&record, false)?;
+            if let Some(checkpoint) = record.checkpoint.as_ref() {
+                if record.request.is_some() || record.response.is_some() {
+                    return Err(Error::Storage("mixed checkpoint record".into()));
+                }
+                session.restore(checkpoint)?;
+            } else {
+                session.record(&record, false)?;
+                session.tail_records += 1;
+            }
         }
         Ok(session)
     }
@@ -78,9 +117,11 @@ impl<S: ClientStateStore> ClientSession<S> {
                     })),
                 }),
                 response: None,
+                checkpoint: None,
             },
             true,
-        )
+        )?;
+        self.compact_if_needed()
     }
 
     /// Persists exact intent and retry identity before a transport may send it.
@@ -91,9 +132,11 @@ impl<S: ClientStateStore> ClientSession<S> {
                     frame: Some(wire::client_frame::Frame::Command(command)),
                 }),
                 response: None,
+                checkpoint: None,
             },
             true,
-        )
+        )?;
+        self.compact_if_needed()
     }
 
     /// Commits an admission or gapless delivery before returning its acknowledgement.
@@ -110,9 +153,11 @@ impl<S: ClientStateStore> ClientSession<S> {
             &SessionRecord {
                 request: None,
                 response: Some(frame),
+                checkpoint: None,
             },
             true,
         )?;
+        self.compact_if_needed()?;
         Ok(acknowledge)
     }
 
@@ -164,7 +209,7 @@ impl<S: ClientStateStore> ClientSession<S> {
                         };
                     }
                     if persist {
-                        self.store.append(record)?;
+                        self.append_record(record)?;
                     }
                     self.cursors.insert(key, cursor.clone());
                 }
@@ -197,7 +242,7 @@ impl<S: ClientStateStore> ClientSession<S> {
                         return Err(Error::Conflict("outbox idempotency identity reused".into()));
                     }
                     if persist {
-                        self.store.append(record)?;
+                        self.append_record(record)?;
                     }
                     self.pending.push(command.clone());
                 }
@@ -218,6 +263,73 @@ impl<S: ClientStateStore> ClientSession<S> {
                 ));
             }
         }
+        Ok(())
+    }
+
+    /// Replaces the journal prefix while retaining the exact cursor/projection pair.
+    pub fn checkpoint(&mut self) -> Result<()> {
+        let checkpoint = SessionRecord {
+            request: None,
+            response: None,
+            checkpoint: Some(SessionCheckpoint {
+                protocol: Some(current_protocol()),
+                cursors: self.cursors.values().cloned().collect(),
+                pending: self.pending.clone(),
+                views_json: serde_json::to_vec(&self.views)
+                    .map_err(|error| Error::Storage(error.to_string()))?,
+            }),
+        };
+        self.store.replace(&checkpoint)?;
+        self.tail_records = 0;
+        Ok(())
+    }
+
+    fn append_record(&mut self, record: &SessionRecord) -> Result<()> {
+        self.store.append(record)?;
+        self.tail_records += 1;
+        Ok(())
+    }
+
+    fn compact_if_needed(&mut self) -> Result<()> {
+        if self.tail_records >= 64 {
+            self.checkpoint()?;
+        }
+        Ok(())
+    }
+
+    fn restore(&mut self, checkpoint: &SessionCheckpoint) -> Result<()> {
+        if checkpoint.protocol.as_ref() != Some(&current_protocol()) {
+            return Err(Error::Conflict("client checkpoint protocol changed".into()));
+        }
+        let mut cursors = BTreeMap::new();
+        for cursor in &checkpoint.cursors {
+            let authority = valid_authority(cursor.authority.as_ref())?;
+            if cursor.generation.is_empty()
+                || cursors
+                    .insert(authority_key(authority), cursor.clone())
+                    .is_some()
+            {
+                return Err(Error::Storage("invalid checkpoint cursor".into()));
+            }
+        }
+        let views = serde_json::from_slice(&checkpoint.views_json)
+            .map_err(|error| Error::Storage(error.to_string()))?;
+        self.cursors = cursors;
+        self.pending.clear();
+        self.views = views;
+        for command in &checkpoint.pending {
+            self.record(
+                &SessionRecord {
+                    request: Some(wire::ClientFrame {
+                        frame: Some(wire::client_frame::Frame::Command(command.clone())),
+                    }),
+                    response: None,
+                    checkpoint: None,
+                },
+                false,
+            )?;
+        }
+        self.tail_records = 0;
         Ok(())
     }
 
@@ -252,7 +364,7 @@ impl<S: ClientStateStore> ClientSession<S> {
             _ => return Err(Error::Invalid("invalid admission state".into())),
         }
         if persist {
-            self.store.append(record)?;
+            self.append_record(record)?;
         }
         self.pending.remove(index);
         Ok(())
@@ -306,7 +418,7 @@ impl<S: ClientStateStore> ClientSession<S> {
             ));
         }
         if persist {
-            self.store.append(record)?;
+            self.append_record(record)?;
         }
         for payload in payloads {
             self.views.apply(authority, payload);

@@ -56,6 +56,9 @@ fn unavailable<T: Send>() -> BoxProviderFuture<'static, Result<T>> {
 }
 
 impl HarnessWireApi for WireFixture {
+    fn acknowledge<'a>(&'a self, _: wire::Acknowledge) -> BoxProviderFuture<'a, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
     fn handshake<'a>(
         &'a self,
         request: wire::HandshakeRequest,

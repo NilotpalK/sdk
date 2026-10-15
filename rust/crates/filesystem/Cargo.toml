@@ -30,7 +30,7 @@ required-features = ["local", "native-mount"]
 [[test]]
 name = "projfs_metadata"
 path = "tests/projfs_metadata.rs"
-required-features = ["local", "native-mount"]
+required-features = ["local", "memory", "native-mount"]
 
 [[bench]]
 name = "filesystem"

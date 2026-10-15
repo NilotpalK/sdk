@@ -27,6 +27,11 @@ name = "projfs_profile"
 path = "tests/projfs_profile.rs"
 required-features = ["local", "native-mount"]
 
+[[test]]
+name = "projfs_metadata"
+path = "tests/projfs_metadata.rs"
+required-features = ["local", "native-mount"]
+
 [[bench]]
 name = "filesystem"
 harness = false

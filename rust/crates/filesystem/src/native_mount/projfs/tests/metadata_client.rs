@@ -13,14 +13,18 @@ pub(super) fn run(
     path: &Path,
     before_action: impl FnOnce() -> Result<(), Box<dyn std::error::Error>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let module = module_path!()
+        .split_once("::")
+        .expect("client belongs to a test crate")
+        .1
+        .strip_suffix("::client")
+        .expect("client is nested beneath its metadata tests");
     let mut child = acyclic_native_runtime::ProcessTree::spawn(
         std::process::Command::new(std::env::current_exe()?)
-            .args([
-                "native_mount::projfs::tests::metadata::external_metadata_only_change_survives_remount",
-                "--exact",
-                "--ignored",
-                "--nocapture",
-            ])
+            .arg(format!(
+                "{module}::external_metadata_only_change_survives_remount"
+            ))
+            .args(["--exact", "--ignored", "--nocapture"])
             .env(MODE, mode)
             .env(PATH, path)
             .stdin(std::process::Stdio::piped())

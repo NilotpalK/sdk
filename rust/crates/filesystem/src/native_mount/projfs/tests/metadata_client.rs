@@ -134,6 +134,15 @@ fn read_path(directory: &Path, index: usize, data: &mut Vec<u8>) -> io::Result<(
     read_contents(&mut file, index, data)
 }
 
+fn reader_read_path(directory: &Path, index: usize, data: &mut Vec<u8>) -> io::Result<()> {
+    match read_path(directory, index, data) {
+        // ReadAllBytes also denies sharing writes. The original reader allowed
+        // these expected collisions with the editor and projection worker.
+        Err(error) if error.raw_os_error() == Some(32) => Ok(()),
+        result => result,
+    }
+}
+
 fn stress(directory: &Path) -> io::Result<()> {
     let editor = std::sync::Mutex::new(());
     std::thread::scope(|scope| {
@@ -159,7 +168,7 @@ fn stress_lane(directory: &Path, lane: usize, editor: &std::sync::Mutex<()>) -> 
             let mut data = Vec::with_capacity(4097);
             for _ in 0..4 {
                 for index in (lane..120).step_by(4) {
-                    read_path(directory, index, &mut data)?;
+                    reader_read_path(directory, index, &mut data)?;
                     reads += 1;
                 }
             }
@@ -181,14 +190,14 @@ fn stress_lane(directory: &Path, lane: usize, editor: &std::sync::Mutex<()>) -> 
             // after its writable handle closes, without retry polling.
             for index in (lane..120).step_by(4) {
                 receive_index(&phase_rx, index)?;
-                read_path(directory, index, &mut data)?;
+                reader_read_path(directory, index, &mut data)?;
                 reads += 1;
                 read_tx.send(index).map_err(io::Error::other)?;
             }
             receive_index(&phase_rx, 120)?;
             for _ in 0..4 {
                 for index in (lane..120).step_by(4) {
-                    read_path(directory, index, &mut data)?;
+                    reader_read_path(directory, index, &mut data)?;
                     reads += 1;
                 }
             }

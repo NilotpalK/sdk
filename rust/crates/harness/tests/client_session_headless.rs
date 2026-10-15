@@ -803,3 +803,93 @@ async fn failed_jsonl_write_never_commits_or_acknowledges_the_delivery() {
     assert_eq!(client.session().resume().cursors[0].revision, 0);
     assert!(host.acknowledgements.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn fresh_jsonl_submission_replaces_the_pre_admission_finite_snapshot() {
+    for already_replayed in [false, true] {
+        let host = Arc::new(Host::default());
+        host.requires_admission.store(true, Ordering::Relaxed);
+        *host.state.lock().unwrap() = Some(wire::CompletionState::Running);
+        let mut state = session();
+        let history = if already_replayed {
+            let previous = delivery(0, LifecycleState::Active);
+            state.receive(frame(previous.clone())).unwrap();
+            vec![previous]
+        } else {
+            Vec::new()
+        };
+        *host.snapshot_history.lock().unwrap() = Some(history);
+        host.through
+            .store(usize::from(already_replayed), Ordering::Relaxed);
+        let final_delivery = delivery(u64::from(already_replayed), LifecycleState::Completed);
+        *host.submit_delivery.lock().unwrap() = Some(final_delivery.clone());
+        let mut client = HarnessClient::connect(host.clone(), state).await.unwrap();
+        let input = futures::stream::iter([Ok(jsonl::client_frame(&wire::ClientFrame {
+            frame: Some(wire::client_frame::Frame::Command(command())),
+        })
+        .unwrap())]);
+        let mut output = Vec::new();
+        let outcome = run_jsonl(&mut client, target(), input, &mut output)
+            .now_or_never()
+            .expect("finite replay must settle without another wakeup")
+            .unwrap();
+        assert_eq!(outcome, HeadlessOutcome::Completed);
+        assert_eq!(outcome.exit_code(), 0);
+        assert_eq!(
+            client.session().resume().cursors[0].revision,
+            u64::from(already_replayed) + 1
+        );
+        assert_eq!(host.commands.lock().unwrap().as_slice(), &[command()]);
+        let deliveries = frames(output)
+            .into_iter()
+            .filter_map(|frame| match frame.frame {
+                Some(wire::server_frame::Frame::Delivery(delivery)) => Some(delivery),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(deliveries, [final_delivery]);
+    }
+}
+
+#[tokio::test]
+async fn settlement_drains_ready_stdin_and_replay() {
+    let host = Arc::new(Host::default());
+    let final_delivery = delivery(0, LifecycleState::Completed);
+    trace(
+        &host,
+        &[LifecycleState::Completed],
+        wire::CompletionState::Succeeded,
+    );
+    let mut state = session();
+    state.receive(frame(final_delivery.clone())).unwrap();
+    let mut client = HarnessClient::connect(host, state).await.unwrap();
+    let input = futures::stream::iter([Ok(jsonl::client_frame(&wire::ClientFrame {
+        frame: Some(wire::client_frame::Frame::Observe(target())),
+    })
+    .unwrap())]);
+    let mut output = Vec::new();
+    assert_eq!(
+        run_jsonl(&mut client, target(), input, &mut output)
+            .now_or_never()
+            .expect("ready sources drain without another wakeup")
+            .unwrap(),
+        HeadlessOutcome::Completed
+    );
+    let output = frames(output);
+    assert_eq!(
+        output
+            .iter()
+            .filter(|frame| matches!(frame.frame, Some(wire::server_frame::Frame::Status(_))))
+            .count(),
+        2
+    );
+    let deliveries = output
+        .into_iter()
+        .filter_map(|frame| match frame.frame {
+            Some(wire::server_frame::Frame::Delivery(delivery)) => Some(delivery),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(deliveries, [final_delivery]);
+    assert_eq!(client.session().resume().cursors[0].revision, 1);
+}

@@ -236,6 +236,7 @@ struct Host {
     through: AtomicUsize,
     live_sender: Mutex<Option<futures::channel::mpsc::UnboundedSender<Result<wire::Delivery>>>>,
     submit_delivery: Mutex<Option<wire::Delivery>>,
+    snapshot_history: Mutex<Option<Vec<wire::Delivery>>>,
     status_sender: Mutex<
         Option<(
             wire::ObserveRequest,
@@ -337,14 +338,18 @@ impl HarnessWireApi for Host {
             if let Some(delivery) = self.submit_delivery.lock().unwrap().take() {
                 self.through
                     .store(delivery.through_revision as usize, Ordering::Relaxed);
+                match self.snapshot_history.lock().unwrap().as_mut() {
+                    Some(history) => history.push(delivery),
+                    None => self
+                        .live_sender
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                        .unbounded_send(Ok(delivery))
+                        .unwrap(),
+                }
                 self.complete(wire::CompletionState::Succeeded);
-                self.live_sender
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .unwrap()
-                    .unbounded_send(Ok(delivery))
-                    .unwrap();
             }
             Ok(admission(&command, wire::AdmissionState::Accepted))
         })
@@ -356,6 +361,16 @@ impl HarnessWireApi for Host {
         Box::pin(async move {
             let after = request.cursors[0].revision;
             self.resumes.lock().unwrap().push(request);
+            if let Some(history) = self.snapshot_history.lock().unwrap().as_ref() {
+                let frames = history
+                    .iter()
+                    .filter(|delivery| delivery.through_revision > after)
+                    .cloned()
+                    .map(Ok)
+                    .collect::<Vec<_>>();
+                return Ok(Box::pin(futures::stream::iter(frames))
+                    as BoxProviderStream<'static, Result<wire::Delivery>>);
+            }
             if let Some(trace) = self.trace.lock().unwrap().take() {
                 return Ok(trace);
             }

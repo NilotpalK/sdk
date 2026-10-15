@@ -150,6 +150,7 @@ enum Incoming {
     Command(Option<Result<String>>),
     Delivery(Result<Option<wire::Delivery>>),
     Status(Option<Result<wire::OperationStatus>>),
+    Settled(Result<HeadlessOutcome>),
 }
 
 async fn follow<S: ClientStateStore>(
@@ -164,36 +165,26 @@ async fn follow<S: ClientStateStore>(
     let mut status = None;
     let mut updates = subscribe(client, target, admitted).await?;
     loop {
-        if let Some(current) = &status {
-            let caught_up = reached(client, current)?;
-            if caught_up && !client.has_buffered_delivery() {
-                if let Some(outcome) = completion(current) {
-                    return Ok(outcome);
-                }
-                let task = target
-                    .owner
-                    .as_ref()
-                    .and_then(|owner| client.session().views().tasks.get(&authority_key(owner)));
-                if task.is_some_and(|task| task.status == LifecycleState::Waiting) {
-                    return Ok(HeadlessOutcome::Blocked);
-                }
-                if updates.is_none() {
-                    return Err(indeterminate(target)?);
-                }
-            }
-            if !caught_up && replay_ended && !client.has_buffered_delivery() {
-                return Err(indeterminate(target)?);
-            }
-        } else if updates.is_none() && !input_open {
-            return Err(if admitted {
-                indeterminate(target)?
-            } else {
-                Error::NotFound("operation was not submitted".into())
-            });
-        }
-        let incoming =
-            next_incoming(client, &mut updates, &mut input, input_open, replay_ended).await;
+        let settled = settlement(
+            client,
+            target,
+            status.as_ref(),
+            updates.is_none(),
+            input_open,
+            admitted,
+            replay_ended,
+        );
+        let incoming = next_incoming(
+            client,
+            &mut updates,
+            &mut input,
+            input_open,
+            replay_ended,
+            settled,
+        )
+        .await;
         match incoming {
+            Incoming::Settled(result) => return result,
             Incoming::Status(Some(change)) => {
                 let change = change?;
                 let frame = wire::ServerFrame {
@@ -216,10 +207,9 @@ async fn follow<S: ClientStateStore>(
                         }
                         wire::AdmissionState::Accepted => {
                             admitted = true;
-                            if replay_ended {
-                                client.replay().await?;
-                                replay_ended = false;
-                            }
+                            // Admission invalidates a pre-submission snapshot even before EOF.
+                            client.replay().await?;
+                            replay_ended = false;
                         }
                         wire::AdmissionState::Unspecified => {
                             return Err(Error::Conflict("unspecified admission".into()));
@@ -248,12 +238,52 @@ async fn follow<S: ClientStateStore>(
     }
 }
 
+fn settlement<S: ClientStateStore>(
+    client: &HarnessClient<S>,
+    target: &wire::ObserveRequest,
+    status: Option<&wire::OperationStatus>,
+    updates_ended: bool,
+    input_open: bool,
+    admitted: bool,
+    replay_ended: bool,
+) -> Result<Option<HeadlessOutcome>> {
+    if let Some(current) = status {
+        let caught_up = reached(client, current)?;
+        if caught_up && !client.has_buffered_delivery() {
+            if let Some(outcome) = completion(current) {
+                return Ok(Some(outcome));
+            }
+            let task = target
+                .owner
+                .as_ref()
+                .and_then(|owner| client.session().views().tasks.get(&authority_key(owner)));
+            if task.is_some_and(|task| task.status == LifecycleState::Waiting) {
+                return Ok(Some(HeadlessOutcome::Blocked));
+            }
+            if updates_ended {
+                return Err(indeterminate(target)?);
+            }
+        }
+        if !caught_up && replay_ended && !client.has_buffered_delivery() {
+            return Err(indeterminate(target)?);
+        }
+    } else if updates_ended && !input_open {
+        return Err(if admitted {
+            indeterminate(target)?
+        } else {
+            Error::NotFound("operation was not submitted".into())
+        });
+    }
+    Ok(None)
+}
+
 async fn next_incoming<S: ClientStateStore>(
     client: &mut HarnessClient<S>,
     updates: &mut Option<BoxProviderStream<'static, Result<wire::OperationStatus>>>,
     input: &mut (impl Stream<Item = Result<String>> + Unpin),
     input_open: bool,
     replay_ended: bool,
+    settled: Result<Option<HeadlessOutcome>>,
 ) -> Incoming {
     let change = async {
         match updates.as_mut() {
@@ -278,11 +308,21 @@ async fn next_incoming<S: ClientStateStore>(
         }
     }
     .fuse();
-    futures::pin_mut!(change, command, delivery);
+    let settled = async {
+        match settled {
+            Ok(Some(outcome)) => Ok(outcome),
+            Err(error) => Err(error),
+            Ok(None) => futures::future::pending().await,
+        }
+    }
+    .fuse();
+    futures::pin_mut!(change, command, delivery, settled);
     futures::select_biased! {
         status = change => Incoming::Status(status),
         line = command => Incoming::Command(line),
         frame = delivery => Incoming::Delivery(frame),
+        // Drain every ready source before accepting a settlement boundary.
+        result = settled => Incoming::Settled(result),
     }
 }
 

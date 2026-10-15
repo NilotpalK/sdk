@@ -115,6 +115,7 @@ tracing.workspace = true
 tokio = { version = "1.48.0", default-features = false, features = ["signal"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+allocation-counter = "=0.8.1"
 tracing-subscriber.workspace = true
 divan.workspace = true
 proptest.workspace = true

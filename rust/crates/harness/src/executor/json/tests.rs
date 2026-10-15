@@ -7,6 +7,52 @@ const BOUNDS: JsonBounds = JsonBounds {
     maximum_depth: 32,
 };
 
+#[cfg(not(target_arch = "wasm32"))]
+fn assert_encoding_needs_no_heap(value: &Value) -> Result<()> {
+    let bytes = crate::contract::canonical_json_bytes(value)?;
+    assert!(bytes.len() > 8 * 4096);
+    let expected = *blake3::hash(&bytes).as_bytes();
+    let mut converted = Ok(Value::Null);
+    let conversion = allocation_counter::measure(|| {
+        converted = serde_json::to_value(value);
+        if let Ok(value) = &mut converted {
+            value.sort_all_objects();
+        }
+    });
+    drop(std::hint::black_box(
+        converted.map_err(|error| Error::Invalid(error.to_string()))?,
+    ));
+    let mut digest = Ok([0; 32]);
+    let encoding = allocation_counter::measure(|| {
+        digest = canonical_json_digest(value, u64::MAX, &mut None);
+    });
+    assert_eq!(digest?, expected);
+    assert_eq!(encoding.count_total, conversion.count_total);
+    assert_eq!(encoding.bytes_total, conversion.bytes_total);
+    assert_eq!(encoding.bytes_max, conversion.bytes_max);
+    assert_eq!(encoding.count_current, 0);
+    assert_eq!(encoding.bytes_current, 0);
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn large_string_digest_has_no_encoding_heap() -> Result<()> {
+    for text in ["x".repeat(1024 * 1024), "\0\n\"\\é".repeat(65_536)] {
+        assert_encoding_needs_no_heap(&Value::String(text))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn nested_digest_has_no_encoding_heap() -> Result<()> {
+    let rows: Vec<_> = (0..256)
+        .map(|index| serde_json::json!({"z": [index, "\0\n\"\\é".repeat(64)], "a": {"id": index}}))
+        .collect();
+    assert_encoding_needs_no_heap(&serde_json::json!({"z": rows, "a": [true, null]}))
+}
+
 #[cfg(feature = "filesystem")]
 #[test]
 fn canonical_digest_preserves_hash_admission_and_charge() -> Result<()> {

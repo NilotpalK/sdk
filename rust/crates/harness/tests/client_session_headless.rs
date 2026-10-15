@@ -1,6 +1,6 @@
 use super::*;
 use acyclic_harness::client::{FileClientState, HeadlessOutcome, run_headless, run_jsonl};
-use futures::FutureExt;
+use futures::{FutureExt, StreamExt};
 use std::{
     fs::OpenOptions,
     io::{Read, Seek, SeekFrom, Write},
@@ -21,6 +21,7 @@ fn target() -> wire::ObserveRequest {
 }
 
 fn trace(host: &Host, states: &[LifecycleState], completion: wire::CompletionState) {
+    host.through.store(states.len(), Ordering::Relaxed);
     *host.state.lock().unwrap() = Some(completion);
     let frames = states
         .iter()
@@ -96,11 +97,11 @@ async fn every_settled_outcome_has_its_documented_exit_code() {
         ));
         assert!(matches!(
             frames[2].frame,
-            Some(wire::server_frame::Frame::Delivery(_))
+            Some(wire::server_frame::Frame::Status(_))
         ));
         assert!(matches!(
             frames[3].frame,
-            Some(wire::server_frame::Frame::Status(_))
+            Some(wire::server_frame::Frame::Delivery(_))
         ));
         assert_eq!(
             host.acknowledgements.lock().unwrap()[0],
@@ -140,6 +141,118 @@ async fn completed_status_does_not_hide_a_racing_final_delivery() {
         .collect::<Vec<_>>();
     assert_eq!(deliveries.len(), 2);
     assert_eq!(deliveries[1].through_revision, 2);
+}
+
+#[tokio::test]
+async fn historical_waiting_is_drained_through_the_observed_settlement_cut() {
+    let host = Arc::new(Host::default());
+    *host.state.lock().unwrap() = Some(wire::CompletionState::Succeeded);
+    host.through.store(3, Ordering::Relaxed);
+    let (sender, receiver) = futures::channel::mpsc::unbounded();
+    *host.trace.lock().unwrap() = Some(Box::pin(receiver));
+    sender
+        .unbounded_send(Ok(delivery(0, LifecycleState::Waiting)))
+        .unwrap();
+    let mut client = HarnessClient::connect(host, session()).await.unwrap();
+    let mut output = Vec::new();
+    {
+        let mut runner = Box::pin(run_headless(&mut client, command(), target(), &mut output));
+        assert!(
+            runner.as_mut().now_or_never().is_none(),
+            "historical waiting is not settlement"
+        );
+        sender
+            .unbounded_send(Ok(delivery(1, LifecycleState::Active)))
+            .unwrap();
+        sender
+            .unbounded_send(Ok(delivery(2, LifecycleState::Completed)))
+            .unwrap();
+        assert_eq!(
+            runner
+                .as_mut()
+                .now_or_never()
+                .expect("settled live replay must return")
+                .unwrap(),
+            HeadlessOutcome::Completed
+        );
+    }
+    let revisions = frames(output)
+        .into_iter()
+        .filter_map(|frame| match frame.frame {
+            Some(wire::server_frame::Frame::Delivery(delivery)) => Some(delivery.through_revision),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(revisions, [1, 2, 3]);
+}
+
+#[tokio::test]
+async fn successful_idle_exits_at_the_cut_without_a_terminal_event_or_eof() {
+    for already_replayed in [false, true] {
+        let host = Arc::new(Host::default());
+        trace(
+            &host,
+            &[LifecycleState::Active],
+            wire::CompletionState::Succeeded,
+        );
+        let mut state = session();
+        if already_replayed {
+            state
+                .receive(frame(delivery(0, LifecycleState::Active)))
+                .unwrap();
+            *host.trace.lock().unwrap() = Some(Box::pin(futures::stream::pending()));
+        } else {
+            let replay = host.trace.lock().unwrap().take().unwrap();
+            *host.trace.lock().unwrap() = Some(Box::pin(replay.chain(futures::stream::pending())));
+        }
+        let mut client = HarnessClient::connect(host, state).await.unwrap();
+        assert_eq!(
+            run_headless(&mut client, command(), target(), &mut Vec::new())
+                .now_or_never()
+                .expect("successful idle must not wait for another prompt")
+                .unwrap(),
+            HeadlessOutcome::Completed
+        );
+        assert_eq!(
+            client.session().views().tasks["AGGREGATE_KIND_TASK:task"].status,
+            LifecycleState::Active
+        );
+    }
+}
+
+#[tokio::test]
+async fn waiting_only_blocks_at_the_current_cut_and_eof_cannot_replace_it() {
+    let host = Arc::new(Host::default());
+    trace(
+        &host,
+        &[
+            LifecycleState::Waiting,
+            LifecycleState::Active,
+            LifecycleState::Waiting,
+        ],
+        wire::CompletionState::Running,
+    );
+    let mut client = HarnessClient::connect(host, session()).await.unwrap();
+    assert_eq!(
+        run_headless(&mut client, command(), target(), &mut Vec::new())
+            .await
+            .unwrap(),
+        HeadlessOutcome::Blocked
+    );
+    assert_eq!(client.session().resume().cursors[0].revision, 3);
+
+    let host = Arc::new(Host::default());
+    trace(
+        &host,
+        &[LifecycleState::Active],
+        wire::CompletionState::Succeeded,
+    );
+    host.through.store(2, Ordering::Relaxed);
+    let mut client = HarnessClient::connect(host, session()).await.unwrap();
+    assert!(matches!(
+        run_headless(&mut client, command(), target(), &mut Vec::new()).await,
+        Err(Error::Indeterminate(_))
+    ));
 }
 
 #[tokio::test]
@@ -255,6 +368,7 @@ async fn jsonl_stdin_can_cancel_while_replay_is_waiting() {
 #[tokio::test]
 async fn jsonl_stdin_submits_wire_commands_and_eof_does_not_cancel() {
     let host = Arc::new(Host::default());
+    *host.state.lock().unwrap() = Some(wire::CompletionState::Running);
     let (sender, receiver) = futures::channel::mpsc::unbounded();
     *host.trace.lock().unwrap() = Some(Box::pin(receiver));
     *host.live_sender.lock().unwrap() = Some(sender);
@@ -284,6 +398,7 @@ async fn jsonl_stdin_submits_wire_commands_and_eof_does_not_cancel() {
 #[tokio::test]
 async fn malformed_stdin_is_rejected_without_a_submit() {
     let host = Arc::new(Host::default());
+    *host.state.lock().unwrap() = Some(wire::CompletionState::Running);
     *host.trace.lock().unwrap() = Some(Box::pin(futures::stream::pending()));
     let mut client = HarnessClient::connect(host.clone(), session())
         .await
@@ -364,12 +479,113 @@ fn native_journal_rejects_corruption() {
         .write(true)
         .open(&path)
         .unwrap();
-    file.seek(SeekFrom::Start(36)).unwrap();
+    file.seek(SeekFrom::Start(68)).unwrap();
     let mut byte = [0];
     file.read_exact(&mut byte).unwrap();
     byte[0] ^= 1;
-    file.seek(SeekFrom::Start(36)).unwrap();
+    file.seek(SeekFrom::Start(68)).unwrap();
     file.write_all(&byte).unwrap();
     drop(file);
     assert!(ClientSession::open(FileClientState::open(&path).unwrap()).is_err());
+}
+
+#[test]
+fn damaged_length_headers_never_truncate_committed_cursors_or_outbox() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("client.journal");
+    let mut native = ClientSession::open(FileClientState::open(&path).unwrap()).unwrap();
+    native.track(session().resume().cursors.remove(0)).unwrap();
+    native.queue(command()).unwrap();
+    native
+        .receive(frame(delivery(0, LifecycleState::Active)))
+        .unwrap();
+    native.checkpoint().unwrap();
+    drop(native);
+    let committed = std::fs::read(&path).unwrap();
+    for size in [u32::MAX, 0] {
+        let mut damaged = committed.clone();
+        damaged[..4].copy_from_slice(&size.to_le_bytes());
+        std::fs::write(&path, &damaged).unwrap();
+        for _ in 0..2 {
+            assert!(ClientSession::open(FileClientState::open(&path).unwrap()).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), damaged);
+        }
+    }
+    std::fs::write(&path, &committed).unwrap();
+    let restored = ClientSession::open(FileClientState::open(&path).unwrap()).unwrap();
+    assert_eq!(restored.resume().cursors[0].revision, 1);
+    assert_eq!(restored.pending().cloned().collect::<Vec<_>>(), [command()]);
+}
+
+#[test]
+fn a_valid_header_with_an_incomplete_payload_is_only_a_torn_append() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("client.journal");
+    let mut native = ClientSession::open(FileClientState::open(&path).unwrap()).unwrap();
+    native.track(session().resume().cursors.remove(0)).unwrap();
+    let committed_length = std::fs::metadata(&path).unwrap().len();
+    native.queue(command()).unwrap();
+    drop(native);
+    let file = OpenOptions::new().write(true).open(&path).unwrap();
+    file.set_len(std::fs::metadata(&path).unwrap().len() - 1)
+        .unwrap();
+    drop(file);
+    let restored = ClientSession::open(FileClientState::open(&path).unwrap()).unwrap();
+    assert_eq!(restored.resume().cursors[0].revision, 0);
+    assert_eq!(restored.pending().count(), 0);
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), committed_length);
+}
+
+#[test]
+fn large_checkpoint_bulk_restores_ordered_outbox_and_identity_indexes() {
+    let mut base = session();
+    base.checkpoint().unwrap();
+    let mut store = base.into_store();
+    let mut checkpoint = store.load().unwrap().remove(0);
+    let pending = (1..=20_000)
+        .map(|index| {
+            let mut command = command();
+            command.operation = Some(wire::OperationIdentity {
+                operation_id: format!("00000000-0000-0000-0000-{index:012}"),
+                idempotency_key: format!("submit-{index}"),
+            });
+            command
+        })
+        .collect::<Vec<_>>();
+    checkpoint.checkpoint.as_mut().unwrap().pending = pending.clone();
+    store.replace(&checkpoint).unwrap();
+    let mut recovered = ClientSession::open(store).unwrap();
+    assert!(recovered.pending().eq(pending.iter()));
+    for index in [19_999, 0, 9_999] {
+        recovered.queue(pending[index].clone()).unwrap();
+        recovered
+            .receive(wire::ServerFrame {
+                frame: Some(wire::server_frame::Frame::Admission(admission(
+                    &pending[index],
+                    wire::AdmissionState::Accepted,
+                ))),
+            })
+            .unwrap();
+        // Both private indexes must release a removed identity.
+        recovered.queue(pending[index].clone()).unwrap();
+    }
+    recovered.checkpoint().unwrap();
+    let recovered = ClientSession::open(recovered.into_store()).unwrap();
+    assert_eq!(recovered.pending().count(), pending.len());
+    assert_eq!(recovered.pending().last(), Some(&pending[9_999]));
+    for duplicate_operation in [false, true] {
+        let mut invalid = checkpoint.clone();
+        let commands = &mut invalid.checkpoint.as_mut().unwrap().pending;
+        let mut collision = commands[0].clone();
+        let identity = collision.operation.as_mut().unwrap();
+        if duplicate_operation {
+            identity.idempotency_key = "distinct-key".into();
+        } else {
+            identity.operation_id = "ffffffff-ffff-ffff-ffff-ffffffffffff".into();
+        }
+        commands.push(collision);
+        let mut store = MemoryClientState::default();
+        store.replace(&invalid).unwrap();
+        assert!(ClientSession::open(store).is_err());
+    }
 }

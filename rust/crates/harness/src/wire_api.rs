@@ -135,7 +135,10 @@ pub fn validate_cancel_request(request: &wire::CancelRequest) -> Result<CancelCo
 
 /// Converts the authoritative scheduler projection to its canonical wire status.
 #[must_use]
-pub fn operation_status(state: &OperationState) -> wire::OperationStatus {
+pub fn operation_status(
+    state: &OperationState,
+    replay_through: wire::ReplayCursor,
+) -> wire::OperationStatus {
     let owner = state.spec.owner.authority();
     let (completion, error) = match state.outcome.as_ref() {
         Some(Outcome::Succeeded(_)) => (wire::CompletionState::Succeeded, None),
@@ -177,6 +180,7 @@ pub fn operation_status(state: &OperationState) -> wire::OperationStatus {
         owner: Some(encode_authority(owner)),
         cancellation_requested: state.cancellation_requested,
         revision: state.revision,
+        replay_through: Some(replay_through),
     }
 }
 
@@ -312,6 +316,7 @@ mod tests {
             owner: Some(owner.clone()),
             cancellation_requested: false,
             revision: 3,
+            replay_through: None,
         };
         validate_operation_status(&observe.operation_id, observe.owner.as_ref(), &status)?;
 

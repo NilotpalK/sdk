@@ -9,6 +9,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+const HEADER_BYTES: usize = 68;
+
 /// File-backed cursor, projection and outbox recovery. Keep its directory private.
 pub struct FileClientState {
     file: File,
@@ -65,26 +67,27 @@ impl ClientStateStore for FileClientState {
         let mut offset = 0;
         let mut records = Vec::new();
         while offset < length {
-            if length - offset < 36 {
+            if length - offset < HEADER_BYTES as u64 {
                 self.truncate(offset)?;
                 break;
             }
-            let mut size = [0; 4];
-            let mut digest = [0; 32];
-            self.file.read_exact(&mut size).map_err(storage)?;
-            self.file.read_exact(&mut digest).map_err(storage)?;
-            let size = u32::from_le_bytes(size);
-            if u64::from(size) > length - offset - 36 {
+            let mut header = [0; HEADER_BYTES];
+            self.file.read_exact(&mut header).map_err(storage)?;
+            if blake3::hash(&header[..36]).as_bytes() != &header[36..] {
+                return Err(storage("client journal header checksum mismatch"));
+            }
+            let size = u32::from_le_bytes(header[..4].try_into().map_err(storage)?);
+            if u64::from(size) > length - offset - HEADER_BYTES as u64 {
                 self.truncate(offset)?;
                 break;
             }
             let mut bytes = vec![0; size as usize];
             self.file.read_exact(&mut bytes).map_err(storage)?;
-            if blake3::hash(&bytes).as_bytes() != &digest {
+            if blake3::hash(&bytes).as_bytes() != &header[4..36] {
                 return Err(Error::Storage("client journal checksum mismatch".into()));
             }
             records.push(SessionRecord::decode(bytes.as_slice()).map_err(storage)?);
-            offset += 36 + u64::from(size);
+            offset += HEADER_BYTES as u64 + u64::from(size);
         }
         Ok(records)
     }
@@ -132,18 +135,20 @@ impl ClientStateStore for FileClientState {
 
 fn encode_record(record: &SessionRecord) -> Result<Vec<u8>> {
     let length = u32::try_from(record.encoded_len()).map_err(storage)?;
-    let mut bytes = Vec::with_capacity(36 + length as usize);
+    let mut bytes = Vec::with_capacity(HEADER_BYTES + length as usize);
     bytes.extend_from_slice(&length.to_le_bytes());
-    bytes.resize(36, 0);
+    bytes.resize(HEADER_BYTES, 0);
     record.encode(&mut bytes).map_err(storage)?;
     let digest = blake3::hash(
         bytes
-            .get(36..)
+            .get(HEADER_BYTES..)
             .ok_or_else(|| storage("journal encoding failed"))?,
     );
     bytes
         .get_mut(4..36)
         .ok_or_else(|| storage("journal header missing"))?
         .copy_from_slice(digest.as_bytes());
+    let header_digest = blake3::hash(&bytes[..36]);
+    bytes[36..HEADER_BYTES].copy_from_slice(header_digest.as_bytes());
     Ok(bytes)
 }

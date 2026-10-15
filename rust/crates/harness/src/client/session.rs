@@ -8,7 +8,7 @@ use crate::{
     Error, Result, wire,
     wire_api::{current_protocol, validate_admission, validate_resume_protocol},
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// One atomically appended recovery record. Contains private command grants.
 #[derive(Clone, PartialEq, prost::Message)]
@@ -76,7 +76,9 @@ impl ClientStateStore for MemoryClientState {
 pub struct ClientSession<S> {
     store: S,
     cursors: BTreeMap<String, wire::ReplayCursor>,
-    pending: Vec<wire::CommandEnvelope>,
+    pending: Vec<Option<wire::CommandEnvelope>>,
+    operations: HashMap<String, usize>,
+    idempotency: HashSet<(String, String)>,
     views: ClientViews,
     tail_records: usize,
 }
@@ -89,11 +91,13 @@ impl<S: ClientStateStore> ClientSession<S> {
             store,
             cursors: BTreeMap::new(),
             pending: Vec::new(),
+            operations: HashMap::new(),
+            idempotency: HashSet::new(),
             views: ClientViews::default(),
             tail_records: 0,
         };
-        for record in records {
-            if let Some(checkpoint) = record.checkpoint.as_ref() {
+        for mut record in records {
+            if let Some(checkpoint) = record.checkpoint.take() {
                 if record.request.is_some() || record.response.is_some() {
                     return Err(Error::Storage("mixed checkpoint record".into()));
                 }
@@ -170,9 +174,13 @@ impl<S: ClientStateStore> ClientSession<S> {
         }
     }
 
+    pub(super) fn cursor(&self, authority: &wire::Authority) -> Option<&wire::ReplayCursor> {
+        self.cursors.get(&authority_key(authority))
+    }
+
     /// Exact envelopes awaiting definitive admission; never regenerate their identities.
     pub fn pending(&self) -> impl Iterator<Item = &wire::CommandEnvelope> {
-        self.pending.iter()
+        self.pending.iter().filter_map(Option::as_ref)
     }
 
     /// State shared by every renderer.
@@ -214,37 +222,25 @@ impl<S: ClientStateStore> ClientSession<S> {
                     self.cursors.insert(key, cursor.clone());
                 }
                 Some(wire::client_frame::Frame::Command(command)) => {
-                    crate::wire_api::validate_command_protocol(command)?;
-                    valid_authority(command.authority.as_ref())?;
-                    let identity = command
-                        .operation
-                        .as_ref()
-                        .ok_or_else(|| Error::Invalid("command identity missing".into()))?;
-                    crate::OperationId::parse(&identity.operation_id)?;
-                    crate::IdempotencyKey::new(identity.idempotency_key.clone())?;
-                    if let Some(existing) = self.pending.iter().find(|pending| {
-                        pending.operation.as_ref().is_some_and(|operation| {
-                            operation.operation_id == identity.operation_id
-                        })
-                    }) {
-                        return if existing == command {
+                    let (identity, key) = command_identity(command)?;
+                    if let Some(index) = self.operations.get(&identity.operation_id) {
+                        return if self.pending.get(*index).and_then(Option::as_ref) == Some(command)
+                        {
                             Ok(())
                         } else {
                             Err(Error::Conflict("outbox operation identity reused".into()))
                         };
                     }
-                    if self.pending.iter().any(|existing| {
-                        existing.authority == command.authority
-                            && existing.operation.as_ref().is_some_and(|operation| {
-                                operation.idempotency_key == identity.idempotency_key
-                            })
-                    }) {
+                    if self.idempotency.contains(&key) {
                         return Err(Error::Conflict("outbox idempotency identity reused".into()));
                     }
                     if persist {
                         self.append_record(record)?;
                     }
-                    self.pending.push(command.clone());
+                    self.operations
+                        .insert(identity.operation_id.clone(), self.pending.len());
+                    self.idempotency.insert(key);
+                    self.pending.push(Some(command.clone()));
                 }
                 _ => return Err(Error::Invalid("unsupported client journal request".into())),
             },
@@ -274,12 +270,21 @@ impl<S: ClientStateStore> ClientSession<S> {
             checkpoint: Some(SessionCheckpoint {
                 protocol: Some(current_protocol()),
                 cursors: self.cursors.values().cloned().collect(),
-                pending: self.pending.clone(),
+                pending: self.pending().cloned().collect(),
                 views_json: serde_json::to_vec(&self.views)
                     .map_err(|error| Error::Storage(error.to_string()))?,
             }),
         };
         self.store.replace(&checkpoint)?;
+        self.pending.retain(Option::is_some);
+        for (index, command) in self.pending.iter().enumerate() {
+            if let Some(identity) = command
+                .as_ref()
+                .and_then(|command| command.operation.as_ref())
+            {
+                self.operations.insert(identity.operation_id.clone(), index);
+            }
+        }
         self.tail_records = 0;
         Ok(())
     }
@@ -297,7 +302,7 @@ impl<S: ClientStateStore> ClientSession<S> {
         Ok(())
     }
 
-    fn restore(&mut self, checkpoint: &SessionCheckpoint) -> Result<()> {
+    fn restore(&mut self, checkpoint: SessionCheckpoint) -> Result<()> {
         if checkpoint.protocol.as_ref() != Some(&current_protocol()) {
             return Err(Error::Conflict("client checkpoint protocol changed".into()));
         }
@@ -314,21 +319,25 @@ impl<S: ClientStateStore> ClientSession<S> {
         }
         let views = serde_json::from_slice(&checkpoint.views_json)
             .map_err(|error| Error::Storage(error.to_string()))?;
-        self.cursors = cursors;
-        self.pending.clear();
-        self.views = views;
-        for command in &checkpoint.pending {
-            self.record(
-                &SessionRecord {
-                    request: Some(wire::ClientFrame {
-                        frame: Some(wire::client_frame::Frame::Command(command.clone())),
-                    }),
-                    response: None,
-                    checkpoint: None,
-                },
-                false,
-            )?;
+        let mut operations = HashMap::with_capacity(checkpoint.pending.len());
+        let mut idempotency = HashSet::with_capacity(checkpoint.pending.len());
+        for (index, command) in checkpoint.pending.iter().enumerate() {
+            let (identity, key) = command_identity(command)?;
+            if operations
+                .insert(identity.operation_id.clone(), index)
+                .is_some()
+                || !idempotency.insert(key)
+            {
+                return Err(Error::Storage(
+                    "duplicate checkpoint command identity".into(),
+                ));
+            }
         }
+        self.cursors = cursors;
+        self.pending = checkpoint.pending.into_iter().map(Some).collect();
+        self.operations = operations;
+        self.idempotency = idempotency;
+        self.views = views;
         self.tail_records = 0;
         Ok(())
     }
@@ -343,19 +352,14 @@ impl<S: ClientStateStore> ClientSession<S> {
             .operation
             .as_ref()
             .ok_or_else(|| Error::Conflict("admission identity missing".into()))?;
-        let index = self
-            .pending
-            .iter()
-            .position(|pending| {
-                pending
-                    .operation
-                    .as_ref()
-                    .is_some_and(|identity| identity.operation_id == operation.operation_id)
-            })
+        let index = *self
+            .operations
+            .get(&operation.operation_id)
             .ok_or_else(|| Error::Conflict("unsolicited admission".into()))?;
         let command = self
             .pending
             .get(index)
+            .and_then(Option::as_ref)
             .ok_or_else(|| Error::Conflict("pending command disappeared".into()))?;
         validate_admission(command, admission)?;
         match wire::AdmissionState::try_from(admission.state) {
@@ -363,10 +367,16 @@ impl<S: ClientStateStore> ClientSession<S> {
             Ok(wire::AdmissionState::Indeterminate) => return Ok(()),
             _ => return Err(Error::Invalid("invalid admission state".into())),
         }
+        let (_, key) = command_identity(command)?;
         if persist {
             self.append_record(record)?;
         }
-        self.pending.remove(index);
+        self.pending[index] = None;
+        self.operations.remove(&operation.operation_id);
+        self.idempotency.remove(&key);
+        if self.operations.is_empty() {
+            self.pending.clear();
+        }
         Ok(())
     }
 
@@ -428,6 +438,23 @@ impl<S: ClientStateStore> ClientSession<S> {
         }
         Ok(())
     }
+}
+
+fn command_identity(
+    command: &wire::CommandEnvelope,
+) -> Result<(&wire::OperationIdentity, (String, String))> {
+    crate::wire_api::validate_command_protocol(command)?;
+    let authority = valid_authority(command.authority.as_ref())?;
+    let identity = command
+        .operation
+        .as_ref()
+        .ok_or_else(|| Error::Invalid("command identity missing".into()))?;
+    crate::OperationId::parse(&identity.operation_id)?;
+    crate::IdempotencyKey::new(identity.idempotency_key.clone())?;
+    Ok((
+        identity,
+        (authority_key(authority), identity.idempotency_key.clone()),
+    ))
 }
 
 fn valid_authority(authority: Option<&wire::Authority>) -> Result<&wire::Authority> {

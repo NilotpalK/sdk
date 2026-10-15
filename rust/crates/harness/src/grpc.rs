@@ -294,6 +294,7 @@ mod tests {
                     owner: request.owner,
                     cancellation_requested: false,
                     revision: 1,
+                    replay_through: None,
                 })
             }
             .boxed()
@@ -322,6 +323,7 @@ mod tests {
                         owner: request.owner,
                         cancellation_requested: false,
                         revision: 2,
+                        replay_through: None,
                     }),
                     operation,
                 })

@@ -63,6 +63,21 @@ impl NativeSession {
             revision: 0,
         }
     }
+    async fn replay_cut(&self, authority: &wire::Authority) -> Result<wire::ReplayCursor> {
+        let binding = self.binding(authority)?;
+        let reader = HistoryReader::new(
+            &self.stream,
+            &binding.authority,
+            &(binding.verifier()?),
+            &mut None,
+        )?;
+        let pinned = reader.pin(0, None).await?;
+        Ok(wire::ReplayCursor {
+            authority: Some(authority.clone()),
+            generation: self.config.generation.clone(),
+            revision: pinned.through_revision,
+        })
+    }
     fn binding(&self, authority: &wire::Authority) -> Result<&AuthorityBinding> {
         self.config
             .bindings()
@@ -207,6 +222,7 @@ impl HarnessWireApi for NativeSession {
                     .scheduler()
                     .operation(control.operation_id)
                     .ok_or_else(|| Error::NotFound("operation".into()))?,
+                self.replay_cut(&encode_authority(&control.owner)).await?,
             ))
         })
     }
@@ -230,7 +246,11 @@ impl HarnessWireApi for NativeSession {
                 )
                 .await?;
             Ok(wire::CancelResponse {
-                status: Some(operation_status(&state)),
+                status: Some(operation_status(
+                    &state,
+                    self.replay_cut(&encode_authority(&control.control.owner))
+                        .await?,
+                )),
                 operation: Some(wire::OperationIdentity {
                     operation_id: control.control.operation_id.to_string(),
                     idempotency_key: control.idempotency_key.0,

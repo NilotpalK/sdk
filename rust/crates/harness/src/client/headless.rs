@@ -135,7 +135,27 @@ async fn follow<S: ClientStateStore>(
     output: &mut impl Write,
 ) -> Result<HeadlessOutcome> {
     let mut input_open = true;
+    let mut ended = false;
+    let mut status = observe(client, target, output).await?;
     loop {
+        let caught_up = reached(client, &status)?;
+        if caught_up {
+            if let Some(outcome) = completion(&status) {
+                return Ok(outcome);
+            }
+            let task = target
+                .owner
+                .as_ref()
+                .and_then(|owner| client.session().views().tasks.get(&authority_key(owner)));
+            if task.is_some_and(|task| task.status == LifecycleState::Waiting) {
+                return Ok(HeadlessOutcome::Blocked);
+            }
+        }
+        if ended {
+            return Err(Error::Indeterminate(crate::OperationId::parse(
+                &target.operation_id,
+            )?));
+        }
         let incoming = if input_open {
             let command = input.next().fuse();
             let delivery = client.next_delivery().fuse();
@@ -150,49 +170,56 @@ async fn follow<S: ClientStateStore>(
         match incoming {
             Incoming::Command(Some(line)) => {
                 dispatch(client, jsonl::parse_client_frame(&line?)?, output).await?;
+                status = observe(client, target, output).await?;
             }
-            Incoming::Command(None) => {
-                input_open = false;
-            }
+            Incoming::Command(None) => input_open = false,
             Incoming::Delivery(delivery) => {
-                let delivery = delivery?;
-                let ended = delivery.is_none();
-                if let Some(delivery) = delivery {
-                    emit(output, wire::server_frame::Frame::Delivery(delivery))?;
+                match delivery? {
+                    Some(delivery) => emit(output, wire::server_frame::Frame::Delivery(delivery))?,
+                    None => ended = true,
                 }
-                let status = client.observe(target.clone()).await?;
-                let outcome = completion(&status);
-                emit(output, wire::server_frame::Frame::Status(status))?;
-                let task = target
-                    .owner
-                    .as_ref()
-                    .and_then(|owner| client.session().views().tasks.get(&authority_key(owner)));
-                // A status reply can race ahead of replay. Drain through the task's
-                // own settled event before leaving a live stream.
-                if (ended
-                    || task.is_some_and(|task| {
-                        matches!(
-                            task.status,
-                            LifecycleState::Completed
-                                | LifecycleState::Failed
-                                | LifecycleState::Cancelled
-                        )
-                    }))
-                    && let Some(outcome) = outcome
-                {
-                    return Ok(outcome);
-                }
-                if task.is_some_and(|task| task.status == LifecycleState::Waiting) {
-                    return Ok(HeadlessOutcome::Blocked);
-                }
-                if ended {
-                    return Err(Error::Indeterminate(crate::OperationId::parse(
-                        &target.operation_id,
-                    )?));
+                // Freeze each observed cut while catching up. Scheduler revisions
+                // and aggregate revisions are independent; only this cursor is a fence.
+                if caught_up {
+                    status = observe(client, target, output).await?;
                 }
             }
         }
     }
+}
+
+async fn observe<S: ClientStateStore>(
+    client: &HarnessClient<S>,
+    target: &wire::ObserveRequest,
+    output: &mut impl Write,
+) -> Result<wire::OperationStatus> {
+    let status = client.observe(target.clone()).await?;
+    emit(output, wire::server_frame::Frame::Status(status.clone()))?;
+    Ok(status)
+}
+
+fn reached<S: ClientStateStore>(
+    client: &HarnessClient<S>,
+    status: &wire::OperationStatus,
+) -> Result<bool> {
+    let through = status
+        .replay_through
+        .as_ref()
+        .ok_or_else(|| Error::Conflict("operation status lacks a replay boundary".into()))?;
+    let authority = through
+        .authority
+        .as_ref()
+        .ok_or_else(|| Error::Conflict("operation replay boundary lacks an authority".into()))?;
+    let cursor = client
+        .session()
+        .cursor(authority)
+        .ok_or_else(|| Error::Conflict("operation replay boundary is not tracked".into()))?;
+    if through.authority != status.owner || through.generation != cursor.generation {
+        return Err(Error::Conflict(
+            "operation replay boundary identity mismatch".into(),
+        ));
+    }
+    Ok(cursor.revision >= through.revision)
 }
 
 async fn dispatch<S: ClientStateStore>(

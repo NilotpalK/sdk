@@ -232,6 +232,7 @@ struct Host {
     hold_ack: AtomicBool,
     trace: Mutex<Option<BoxProviderStream<'static, Result<wire::Delivery>>>>,
     state: Mutex<Option<wire::CompletionState>>,
+    through: AtomicUsize,
     live_sender: Mutex<Option<futures::channel::mpsc::UnboundedSender<Result<wire::Delivery>>>>,
     submit_delivery: Mutex<Option<wire::Delivery>>,
 }
@@ -271,6 +272,9 @@ impl HarnessWireApi for Host {
                 return Err(Error::Storage("connection lost after admission".into()));
             }
             if let Some(delivery) = self.submit_delivery.lock().unwrap().take() {
+                self.through
+                    .store(delivery.through_revision as usize, Ordering::Relaxed);
+                *self.state.lock().unwrap() = Some(wire::CompletionState::Succeeded);
                 self.live_sender
                     .lock()
                     .unwrap()
@@ -311,6 +315,11 @@ impl HarnessWireApi for Host {
         Box::pin(async move {
             Ok(wire::OperationStatus {
                 protocol: Some(current_protocol()),
+                replay_through: Some(wire::ReplayCursor {
+                    authority: request.owner.clone(),
+                    generation: "generation".into(),
+                    revision: self.through.load(Ordering::Relaxed) as u64,
+                }),
                 owner: request.owner,
                 operation: Some(wire::OperationIdentity {
                     operation_id: request.operation_id,
@@ -331,6 +340,7 @@ impl HarnessWireApi for Host {
     ) -> BoxProviderFuture<'_, Result<wire::CancelResponse>> {
         Box::pin(async move {
             *self.state.lock().unwrap() = Some(wire::CompletionState::Cancelled);
+            self.through.store(1, Ordering::Relaxed);
             if let Some(sender) = self.live_sender.lock().unwrap().as_ref() {
                 sender
                     .unbounded_send(Ok(delivery(0, LifecycleState::Cancelled)))

@@ -13,9 +13,10 @@ tokio::task_local! {
     static DEFERRED: bool;
 }
 
-/// Defers the final device flush for local-stream mutations made by `future`.
-/// A subsequent mutation still flushes its predecessor before writing another
-/// frame. Call [`LocalStream::flush`] to make the final deferred frame durable.
+/// Defers synchronization of local-stream mutations made by `future`.
+/// A subsequent mutation still synchronizes its predecessor before writing another
+/// frame. Call [`LocalStream::flush`] to apply the configured durability policy
+/// to the final deferred frame.
 pub async fn deferring_durability<F: Future>(future: F) -> F::Output {
     DEFERRED.scope(true, future).await
 }

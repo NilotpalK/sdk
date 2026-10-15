@@ -28,12 +28,17 @@ async fn fixture() -> Result<Fixture> {
     let writer =
         FilesystemContentPublisher::new(host.clone(), &private, &verifier, &signed, 65_536, None)?;
     let scope = RuntimeScope::new(signed.capabilities().clone(), Limits::default())?;
-    let journal: Arc<dyn ExecutionJournal> = Arc::new(journal(
+    let journal: Arc<dyn ExecutionJournal> = Arc::new(FilesystemExecutionJournal::new(
         Arc::new(MemoryStream::default()),
         host,
-        &private,
-        &issuer,
-        &signed,
+        &SchemaRegistry::new(),
+        acyclic_harness::filesystem::FilesystemJournalBinding {
+            volume: &private,
+            verifier: &verifier,
+            scope: &signed,
+            maximum_bytes: 65_536,
+            io: None,
+        },
     )?);
     let mut tools = ToolRegistry::default();
     tools.register((update_plan()?, None), &mut None, None)?;

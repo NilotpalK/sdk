@@ -225,7 +225,6 @@ pub(super) unsafe fn notification(
                 defer_host_capture(operation_failures.as_ref(), capture_path);
                 return Ok(());
             };
-            *retry_path.borrow_mut() = Some(capture_path.clone());
             let host =
                 probe_host_windows_metadata(metadata_root, &capture_path, metadata_probes, &work)?;
             if baseline.identity != host.identity
@@ -238,8 +237,8 @@ pub(super) unsafe fn notification(
             }
             let cached_binding = lock_recover(projection).get(&capture_path).copied();
             let metadata_changed = metadata_changed_since_open(baseline, host);
-            if !metadata_changed {
-                *retry_path.borrow_mut() = None;
+            if metadata_changed {
+                *retry_path.borrow_mut() = Some(capture_path.clone());
             }
             if !metadata_changed
                 && !has_pending_capture(operation_failures.as_ref(), &capture_path)

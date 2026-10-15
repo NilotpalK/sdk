@@ -22,6 +22,11 @@ name = "cloud_contract"
 path = "tests/cloud_contract.rs"
 required-features = ["memory"]
 
+[[test]]
+name = "projfs_profile"
+path = "tests/projfs_profile.rs"
+required-features = ["local", "native-mount"]
+
 [[bench]]
 name = "filesystem"
 harness = false

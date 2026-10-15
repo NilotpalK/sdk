@@ -87,38 +87,8 @@ impl<S: crate::AsyncObjectStore> ProofContext<'_, S> {
         if diff.0.truncated {
             return Ok(None);
         }
-        // Existing bindings and identities stay intact; other transitions use the full proof.
-        for change in &diff.0.files {
-            self.examine(1)?;
-            let Some(after) = change.after else {
-                return Ok(None);
-            };
-            if after.link_count != 1
-                || !matches!(
-                    after.kind,
-                    crate::kernel::FileKind::Directory | crate::kernel::FileKind::Regular
-                )
-                || change
-                    .before
-                    .is_some_and(|before| before.kind != after.kind || before.link_count != 1)
-            {
-                return Ok(None);
-            }
-        }
-        for binding in &diff.0.bindings {
-            self.examine(1)?;
-            let Some(after) = &binding.after else {
-                return Ok(None);
-            };
-            if binding.before.is_some()
-                || !diff.0.files.iter().any(|change| {
-                    change.file_id == after.file_id
-                        && change.before.is_none()
-                        && change.after.is_some_and(|record| record.kind == after.kind)
-                })
-            {
-                return Ok(None);
-            }
+        if !self.validate_increment_namespace(&diff.0)? {
+            return Ok(None);
         }
         let mut file_count = previous.file_count;
         let mut logical_bytes = previous.logical_file_bytes;
@@ -133,56 +103,6 @@ impl<S: crate::AsyncObjectStore> ProofContext<'_, S> {
                 .ok_or(ClosureError::LogicalBytesOverflow)?;
             if change.before.is_none() {
                 file_count = file_count.checked_add(1).ok_or(WorkError::Overflow)?;
-                if diff
-                    .0
-                    .bindings
-                    .iter()
-                    .filter(|binding| {
-                        binding
-                            .after
-                            .as_ref()
-                            .is_some_and(|entry| entry.file_id == change.file_id)
-                    })
-                    .count()
-                    != 1
-                {
-                    return Ok(None);
-                }
-                let mut id = change.file_id;
-                let mut anchored = false;
-                for _ in 0..diff.0.files.len() {
-                    self.examine(1)?;
-                    let Some(parent) = diff.0.bindings.iter().find(|binding| {
-                        binding
-                            .after
-                            .as_ref()
-                            .is_some_and(|entry| entry.file_id == id)
-                    }) else {
-                        break;
-                    };
-                    let Some(parent_record) = diff
-                        .0
-                        .files
-                        .iter()
-                        .find(|change| change.file_id == parent.directory_id)
-                    else {
-                        break;
-                    };
-                    if !parent_record
-                        .after
-                        .is_some_and(|record| record.kind == crate::kernel::FileKind::Directory)
-                    {
-                        break;
-                    }
-                    if parent_record.before.is_some() {
-                        anchored = true;
-                        break;
-                    }
-                    id = parent.directory_id;
-                }
-                if !anchored {
-                    return Ok(None);
-                }
             }
         }
         if file_count > self.limits.maximum_files {
@@ -223,6 +143,135 @@ impl<S: crate::AsyncObjectStore> ProofContext<'_, S> {
         }
         self.object_bytes = bytes;
         Ok(Some((file_count, logical_bytes, object_count)))
+    }
+
+    fn validate_increment_namespace(
+        &self,
+        diff: &crate::GenerationDiff,
+    ) -> Result<bool, crate::FsError> {
+        // File changes arrive in FileId order from the authenticated file-table diff.
+        let mut links = ProofVec::new(&self.meter);
+        for change in &diff.files {
+            self.examine(1)?;
+            let Some(after) = change.after else {
+                return Ok(false);
+            };
+            if after.link_count != 1
+                || !matches!(
+                    after.kind,
+                    crate::kernel::FileKind::Directory | crate::kernel::FileKind::Regular
+                )
+                || change
+                    .before
+                    .is_some_and(|before| before.kind != after.kind || before.link_count != 1)
+            {
+                return Ok(false);
+            }
+            links.push(IncrementLink {
+                parent: None,
+                anchored: change.before.is_some(),
+                visiting: false,
+            })?;
+        }
+        for binding in &diff.bindings {
+            self.examine(1)?;
+            let Some(after) = &binding.after else {
+                return Ok(false);
+            };
+            if binding.before.is_some() {
+                return Ok(false);
+            }
+            let Some(child) = self.increment_file(&diff.files, after.file_id)? else {
+                return Ok(false);
+            };
+            let Some(parent) = self.increment_file(&diff.files, binding.directory_id)? else {
+                return Ok(false);
+            };
+            let change = diff
+                .files
+                .get(child)
+                .ok_or(crate::ObjectStoreError::Corrupt)?;
+            if change.before.is_some()
+                || !change.after.is_some_and(|record| record.kind == after.kind)
+                || !diff
+                    .files
+                    .get(parent)
+                    .ok_or(crate::ObjectStoreError::Corrupt)?
+                    .after
+                    .is_some_and(|record| record.kind == crate::kernel::FileKind::Directory)
+                || links
+                    .values
+                    .get_mut(child)
+                    .ok_or(crate::ObjectStoreError::Corrupt)?
+                    .parent
+                    .replace(parent)
+                    .is_some()
+            {
+                return Ok(false);
+            }
+        }
+        for start in 0..links.values.len() {
+            let mut next = start;
+            loop {
+                self.examine(1)?;
+                let link = links
+                    .values
+                    .get_mut(next)
+                    .ok_or(crate::ObjectStoreError::Corrupt)?;
+                if link.anchored {
+                    break;
+                }
+                if link.visiting {
+                    return Ok(false);
+                }
+                link.visiting = true;
+                let Some(parent) = link.parent else {
+                    return Ok(false);
+                };
+                next = parent;
+            }
+            // Each new directory's ancestry is authenticated once, including shared prefixes.
+            next = start;
+            loop {
+                self.examine(1)?;
+                let link = links
+                    .values
+                    .get_mut(next)
+                    .ok_or(crate::ObjectStoreError::Corrupt)?;
+                if link.anchored {
+                    break;
+                }
+                link.anchored = true;
+                let Some(parent) = link.parent else {
+                    return Ok(false);
+                };
+                next = parent;
+            }
+        }
+        Ok(true)
+    }
+
+    fn increment_file(
+        &self,
+        files: &[crate::FileRecordChange],
+        id: FileId,
+    ) -> Result<Option<usize>, crate::FsError> {
+        let (mut low, mut high) = (0, files.len());
+        while low < high {
+            self.examine(1)?;
+            let middle = low + (high - low) / 2;
+            match files
+                .get(middle)
+                .ok_or(crate::ObjectStoreError::Corrupt)?
+                .file_id
+                .cmp(&id)
+            {
+                std::cmp::Ordering::Equal => return Ok(Some(middle)),
+                std::cmp::Ordering::Less => low = middle + 1,
+                std::cmp::Ordering::Greater => high = middle,
+            }
+        }
+        Ok(None)
     }
 
     async fn collect_pages<F: crate::kernel::persistent_btree::Format>(
@@ -377,6 +426,12 @@ impl<S: crate::AsyncObjectStore> ProofContext<'_, S> {
     }
 }
 
+struct IncrementLink {
+    parent: Option<usize>,
+    anchored: bool,
+    visiting: bool,
+}
+
 fn file_bytes(record: FileRecord) -> u128 {
     match record.payload {
         FilePayload::Regular { logical_bytes, .. } => u128::from(logical_bytes),
@@ -384,3 +439,6 @@ fn file_bytes(record: FileRecord) -> u128 {
         _ => 0,
     }
 }
+
+#[cfg(test)]
+mod tests;

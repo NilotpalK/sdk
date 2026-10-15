@@ -46,13 +46,19 @@ impl State {
         left
     }
 
-    fn insert_replay(&mut self, root: Option<usize>, index: usize) -> usize {
+    fn insert_replay(
+        &mut self,
+        root: Option<usize>,
+        index: usize,
+        probe: &mut impl FnMut(),
+    ) -> usize {
         let Some(root) = root else { return index };
+        probe();
         if self.replay_entry(index).replay.as_deref() < self.replay_entry(root).replay.as_deref() {
-            let left = self.insert_replay(self.replay_entry(root).replay_left, index);
+            let left = self.insert_replay(self.replay_entry(root).replay_left, index, probe);
             self.replay_entry_mut(root).replay_left = Some(left);
         } else {
-            let right = self.insert_replay(self.replay_entry(root).replay_right, index);
+            let right = self.insert_replay(self.replay_entry(root).replay_right, index, probe);
             self.replay_entry_mut(root).replay_right = Some(right);
         }
         self.update_replay_height(root);
@@ -80,5 +86,81 @@ impl State {
         } else {
             root
         }
+    }
+}
+
+#[derive(Default)]
+struct ReplayProbes {
+    #[cfg(not(target_arch = "wasm32"))]
+    meter: Option<Arc<dyn NativeReadMeter>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    remaining: u64,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl ReplayProbes {
+    fn record(&mut self, items: u64) -> std::io::Result<()> {
+        if let Some(meter) = &self.meter {
+            self.remaining = self
+                .remaining
+                .checked_sub(items)
+                .unwrap_or_else(|| unreachable!("reserved AVL height"));
+            return meter.record_reserved_examination(items);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ReplayProbes {
+    fn drop(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(meter) = &self.meter {
+            meter.cancel_reserved_examination(self.remaining);
+        }
+    }
+}
+
+impl MemoryStream {
+    fn record_replay_probe(&self, probes: &mut ReplayProbes) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(work) = &self.work {
+            let _ = work.record(probes.record(1));
+        }
+        let _ = probes;
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    fn maximum_replay_height(&self) -> u64 {
+        2 * u64::from(self.limits.idempotency_results.saturating_add(1).ilog2() + 1)
+    }
+
+    fn replay<'a>(
+        &self,
+        state: &'a State,
+        key: &[u8],
+    ) -> Result<Option<&'a Retained>, StreamError> {
+        state.replay(key, || {
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some(work) = &self.work {
+                work.record(work.meter.examine(1, 0))?;
+            }
+            Ok(())
+        })
+    }
+
+    fn reserve_replay_probes(&self, remaining: u64) -> Result<ReplayProbes, StreamError> {
+        if remaining == 0 {
+            return Ok(ReplayProbes::default());
+        }
+        let _ = remaining;
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(work) = &self.work {
+            work.record(work.meter.reserve_examination(remaining))?;
+        }
+        Ok(ReplayProbes {
+            #[cfg(not(target_arch = "wasm32"))]
+            meter: self.work.as_ref().map(|work| Arc::clone(&work.meter)),
+            #[cfg(not(target_arch = "wasm32"))]
+            remaining,
+        })
     }
 }

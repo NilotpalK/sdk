@@ -16,17 +16,22 @@ struct State {
 }
 
 impl State {
-    fn replay(&self, key: &[u8]) -> Option<&Retained> {
+    fn replay<E>(
+        &self,
+        key: &[u8],
+        mut probe: impl FnMut() -> Result<(), E>,
+    ) -> Result<Option<&Retained>, E> {
         let mut next = self.replay_root;
         while let Some(index) = next {
-            let entry = self.retained.get(index)?;
-            match entry.replay.as_deref()?.cmp(key) {
-                std::cmp::Ordering::Equal => return Some(entry),
+            probe()?;
+            let entry = self.replay_entry(index);
+            match entry.replay.as_deref().cmp(&Some(key)) {
+                std::cmp::Ordering::Equal => return Ok(Some(entry)),
                 std::cmp::Ordering::Less => next = entry.replay_right,
                 std::cmp::Ordering::Greater => next = entry.replay_left,
             }
         }
-        None
+        Ok(None)
     }
     fn replay_count(&self) -> usize {
         self.replay_count

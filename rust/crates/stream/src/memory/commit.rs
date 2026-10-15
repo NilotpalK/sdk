@@ -34,6 +34,7 @@ impl CommitPlan {
     fn publish(
         self,
         state: &mut State,
+        probe: &mut impl FnMut(),
         key: IdempotencyKey,
         digest: [u8; 32],
         time: u64,
@@ -46,6 +47,7 @@ impl CommitPlan {
         state.last_committed_at_micros = time;
         retain(
             state,
+            probe,
             None,
             Some(key),
             digest,
@@ -278,7 +280,7 @@ impl MemoryStream {
         digest: [u8; 32],
         deadline: Option<u64>,
     ) -> Result<(CommitOutcome, Allocation), StreamError> {
-        if let Some(replay) = state.replay(request.idempotency_key.as_bytes()) {
+        if let Some(replay) = self.replay(state, request.idempotency_key.as_bytes())? {
             if replay.digest != digest {
                 return Err(StreamError::IdempotencyMismatch);
             }
@@ -296,6 +298,8 @@ impl MemoryStream {
         };
         check_deadline()?;
         admit_replay(state, Some(&request.idempotency_key), self.limits)?;
+        let mut probes =
+            self.reserve_replay_probes(u64::from(state.replay_height(state.replay_root)))?;
         let (mut conflicts, output_claim) = self.vector(request.conditions.len())?;
         conflicts.extend(
             request
@@ -311,6 +315,7 @@ impl MemoryStream {
                 check_deadline()?;
                 retain(
                     state,
+                    &mut || self.record_replay_probe(&mut probes),
                     None,
                     Some(request.idempotency_key),
                     digest,
@@ -343,7 +348,13 @@ impl MemoryStream {
                 .last_committed_at_micros
                 .max(self.commit_clock.now_unix_millis().saturating_mul(1_000));
             plan.bind(commit_id, time)?;
-            plan.publish(state, request.idempotency_key, digest, time)
+            plan.publish(
+                state,
+                &mut || self.record_replay_probe(&mut probes),
+                request.idempotency_key,
+                digest,
+                time,
+            )
         })
     }
 }

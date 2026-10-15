@@ -1,0 +1,386 @@
+use super::*;
+
+impl<S: crate::AsyncObjectStore> ProofContext<'_, S> {
+    async fn changes(
+        &self,
+        before: ObjectId,
+        after: ObjectId,
+    ) -> Result<(crate::GenerationDiff, ProofGuard), crate::FsError> {
+        let maximum = u32::try_from(self.limits.maximum_files).unwrap_or(u32::MAX);
+        let (diff, allocation) = match &self.meter {
+            #[cfg(not(target_arch = "wasm32"))]
+            ProofMeter::Native {
+                original,
+                cancellation,
+            } => {
+                let mut accounting =
+                    crate::kernel::allocation::KernelAccounting::native(original, cancellation);
+                let (diff, allocation) = crate::facade::diff_generation_file_tables(
+                    self.store,
+                    before,
+                    after,
+                    maximum,
+                    self.limits.decode,
+                    &mut accounting,
+                    cancellation,
+                )
+                .await?;
+                let crate::kernel::allocation::KernelOwnedAllocation::NativeOriginal(allocation) =
+                    allocation
+                else {
+                    return Err(crate::NativeTreeMaterializationError::InvalidLayout.into());
+                };
+                return Ok((diff, ProofGuard::Native(allocation)));
+            }
+            ProofMeter::Standalone { cancellation, .. } => {
+                let remaining = self
+                    .meter
+                    .with_accounting(|accounting| accounting.remaining())?;
+                let mut accounting = crate::kernel::allocation::KernelAccounting::standalone(
+                    remaining,
+                    cancellation,
+                );
+                let result = crate::facade::diff_generation_file_tables(
+                    self.store,
+                    before,
+                    after,
+                    maximum,
+                    self.limits.decode,
+                    &mut accounting,
+                    cancellation,
+                )
+                .await;
+                self.meter.with_accounting(|parent| {
+                    let (allocations, work, budget, _) = parent
+                        .standalone_parts()
+                        .ok_or(crate::FsError::HandleAllocationFailed)?;
+                    *work = work.with_backend(accounting.spent(), allocations.live_bytes())?;
+                    work.verify(budget)?;
+                    Ok(())
+                })?;
+                result?
+            }
+        };
+        drop(allocation);
+        let bytes = (diff.files.capacity() * size_of::<crate::FileRecordChange>())
+            .checked_add(diff.bindings.capacity() * size_of::<crate::DirectoryBindingChange>())
+            .and_then(|bytes| {
+                diff.bindings.iter().try_fold(bytes, |bytes, binding| {
+                    bytes.checked_add(binding.name.retained_bytes())
+                })
+            })
+            .ok_or(WorkError::Overflow)? as u64;
+        self.meter.owned(|accounting| {
+            let allocation = accounting.claim_owned(bytes, 0)?;
+            Ok((diff, allocation, bytes))
+        })
+    }
+
+    pub(super) async fn prove_increment(
+        &mut self,
+        root: &GenerationRoot,
+        previous: &CachedProof,
+    ) -> Result<Option<(u64, u128, u64)>, crate::FsError> {
+        let diff = self
+            .changes(previous.root.file_table, root.file_table)
+            .await?;
+        if diff.0.truncated {
+            return Ok(None);
+        }
+        // Existing bindings and identities stay intact; other transitions use the full proof.
+        for change in &diff.0.files {
+            self.examine(1)?;
+            let Some(after) = change.after else {
+                return Ok(None);
+            };
+            if after.link_count != 1
+                || !matches!(
+                    after.kind,
+                    crate::kernel::FileKind::Directory | crate::kernel::FileKind::Regular
+                )
+                || change
+                    .before
+                    .is_some_and(|before| before.kind != after.kind || before.link_count != 1)
+            {
+                return Ok(None);
+            }
+        }
+        for binding in &diff.0.bindings {
+            self.examine(1)?;
+            let Some(after) = &binding.after else {
+                return Ok(None);
+            };
+            if binding.before.is_some()
+                || !diff.0.files.iter().any(|change| {
+                    change.file_id == after.file_id
+                        && change.before.is_none()
+                        && change.after.is_some_and(|record| record.kind == after.kind)
+                })
+            {
+                return Ok(None);
+            }
+        }
+        let mut file_count = previous.file_count;
+        let mut logical_bytes = previous.logical_file_bytes;
+        for change in &diff.0.files {
+            self.examine(1)?;
+            let Some(after) = change.after else {
+                return Ok(None);
+            };
+            logical_bytes = logical_bytes
+                .checked_sub(change.before.map_or(0, file_bytes))
+                .and_then(|bytes| bytes.checked_add(file_bytes(after)))
+                .ok_or(ClosureError::LogicalBytesOverflow)?;
+            if change.before.is_none() {
+                file_count = file_count.checked_add(1).ok_or(WorkError::Overflow)?;
+                if diff
+                    .0
+                    .bindings
+                    .iter()
+                    .filter(|binding| {
+                        binding
+                            .after
+                            .as_ref()
+                            .is_some_and(|entry| entry.file_id == change.file_id)
+                    })
+                    .count()
+                    != 1
+                {
+                    return Ok(None);
+                }
+                let mut id = change.file_id;
+                let mut anchored = false;
+                for _ in 0..diff.0.files.len() {
+                    self.examine(1)?;
+                    let Some(parent) = diff.0.bindings.iter().find(|binding| {
+                        binding
+                            .after
+                            .as_ref()
+                            .is_some_and(|entry| entry.file_id == id)
+                    }) else {
+                        break;
+                    };
+                    let Some(parent_record) = diff
+                        .0
+                        .files
+                        .iter()
+                        .find(|change| change.file_id == parent.directory_id)
+                    else {
+                        break;
+                    };
+                    if !parent_record
+                        .after
+                        .is_some_and(|record| record.kind == crate::kernel::FileKind::Directory)
+                    {
+                        break;
+                    }
+                    if parent_record.before.is_some() {
+                        anchored = true;
+                        break;
+                    }
+                    id = parent.directory_id;
+                }
+                if !anchored {
+                    return Ok(None);
+                }
+            }
+        }
+        if file_count > self.limits.maximum_files {
+            return Ok(None);
+        }
+        self.collect_pages::<crate::kernel::file_table_mutation::FileTableFormat>(
+            root.file_table,
+            Some(previous.root.file_table),
+        )
+        .await?;
+        for change in &diff.0.files {
+            let Some(record) = change.after else {
+                return Ok(None);
+            };
+            if let FilePayload::Directory { entries } = record.payload {
+                self.prove_metadata(record.metadata).await?;
+                let before = change.before.and_then(|record| match record.payload {
+                    FilePayload::Directory { entries } => Some(entries),
+                    _ => None,
+                });
+                self.collect_pages::<crate::kernel::tree_mutation::TreeFormat>(entries, before)
+                    .await?;
+            } else {
+                self.prove_record(&record).await?;
+            }
+        }
+        let bytes = previous
+            .object_bytes
+            .checked_add(self.object_bytes)
+            .ok_or(WorkError::Overflow)?;
+        // These are conservative bounds; recompute the exact closure when they reach a limit.
+        let object_count = previous
+            .object_count
+            .checked_add(self.objects.values.len() as u64)
+            .ok_or(WorkError::Overflow)?;
+        if bytes > self.limits.maximum_object_bytes || object_count > self.limits.maximum_objects {
+            return Ok(None);
+        }
+        self.object_bytes = bytes;
+        Ok(Some((file_count, logical_bytes, object_count)))
+    }
+
+    async fn collect_pages<F: crate::kernel::persistent_btree::Format>(
+        &mut self,
+        root: ObjectId,
+        before: Option<ObjectId>,
+    ) -> Result<(), crate::FsError> {
+        use crate::kernel::persistent_btree::Page;
+        Self::require_kind(root, F::kind())?;
+        let mut pending: ProofVec<'_, (PendingPage<F::Key>, Option<ObjectId>)> =
+            ProofVec::new(&self.meter);
+        pending.push(((root, None, None), before))?;
+        let mut pages = ProofVec::new(&self.meter);
+        while let Some(((id, lower, upper), before)) = pending.values.pop() {
+            self.examine(1)?;
+            if !set_insert(&mut pages, id)? {
+                return Err(ClosureError::RoutingAlias.into());
+            }
+            let old_bytes = if let Some(before) = before.filter(|before| *before != id) {
+                self.meter.charge(WorkCounters {
+                    page_reads: 1,
+                    ..WorkCounters::UNCHARGED
+                })?;
+                let bytes = self
+                    .meter
+                    .read(self.store, before, self.limits.decode.maximum_object_bytes)
+                    .await?;
+                self.object_bytes = self
+                    .object_bytes
+                    .checked_add(usize_to_u64(bytes.0.bytes.len()))
+                    .ok_or(WorkError::Overflow)?;
+                Some(bytes)
+            } else {
+                None
+            };
+            let bytes = self.read_object(id, true).await?;
+            let page = self.meter.decode_steps(|observe| {
+                F::decode(&bytes.0.bytes, self.limits.decode, &mut |step| {
+                    observe(step)
+                })
+            })?;
+            drop(bytes);
+            let old = old_bytes
+                .as_ref()
+                .map(|bytes| {
+                    self.meter.decode_steps(|observe| {
+                        F::decode(&bytes.0.bytes, self.limits.decode, &mut |step| {
+                            observe(step)
+                        })
+                    })
+                })
+                .transpose()?;
+            drop(old_bytes);
+            let old_children = old.as_ref().and_then(|page| match &page.0 {
+                Page::Internal(children) => Some(children.as_slice()),
+                Page::Leaf(_) => None,
+            });
+            let reused = before == Some(id)
+                || old_children
+                    .is_some_and(|children| children.iter().any(|child| child.page == id));
+            let lower = lower.as_ref().map(|key| &key.0);
+            let upper = upper.as_ref().map(|key| &key.0);
+            match &page.0 {
+                Page::Leaf(values) => {
+                    validate_ordered_bounds(values.iter().map(F::key), lower, upper)?;
+                }
+                Page::Internal(children) => {
+                    validate_ordered_bounds(
+                        children.iter().map(|child| &child.first),
+                        lower,
+                        upper,
+                    )?;
+                    for (index, child) in children.iter().enumerate().rev() {
+                        // A proven subtree needs only its boundary checked against its new parent.
+                        if reused && index + 1 != children.len() {
+                            continue;
+                        }
+                        let upper_key = children.get(index + 1).map(|next| &next.first).or(upper);
+                        // Equal immutable pages under equal bounds retain their parent proof.
+                        if old_children.is_some_and(|old| {
+                            old.iter().zip(old.iter().skip(1)).any(|(old, next)| {
+                                old.page == child.page
+                                    && old.first == child.first
+                                    && upper_key == Some(&next.first)
+                            })
+                        }) {
+                            continue;
+                        }
+                        let lower = self
+                            .meter
+                            .clone_key::<F>(&child.first, self.limits.decode.maximum_name_bytes)?;
+                        let upper = upper_key
+                            .map(|key| {
+                                self.meter
+                                    .clone_key::<F>(key, self.limits.decode.maximum_name_bytes)
+                            })
+                            .transpose()?;
+                        let prior = if reused || before == Some(child.page) {
+                            Some(child.page)
+                        } else if let Some(children) = old_children {
+                            children
+                                .iter()
+                                .find(|old| old.page == child.page)
+                                .or_else(|| {
+                                    children.iter().rev().find(|old| old.first <= child.first)
+                                })
+                                .map(|old| old.page)
+                        } else {
+                            before
+                        };
+                        pending.push(((child.page, Some(lower), upper), prior))?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn remember(
+        &self,
+        cache: Option<&Mutex<Option<Arc<CachedProof>>>>,
+        proof: &GenerationProof,
+        object_count: u64,
+    ) -> Result<(), crate::FsError> {
+        let Some(cache) = cache else { return Ok(()) };
+        let root = self.meter.owned(|accounting| {
+            let (root, allocation) =
+                crate::collection::clone_generation_root_with_accounting(&proof.root, accounting)?;
+            let bytes = (root.parents.capacity() * size_of::<GenerationId>()) as u64;
+            Ok((root, allocation, bytes))
+        })?;
+        let mut root = root;
+        let mut header = self.meter.owned(|accounting| {
+            let bytes = (size_of::<CachedProof>() + 2 * size_of::<usize>()) as u64;
+            Ok(((), accounting.claim_owned(bytes, 1)?, bytes))
+        })?;
+        root.1.absorb(&mut header.1)?;
+        let cached = CachedProof {
+            limits: self.limits,
+            root: root.0,
+            generation_id: proof.generation_id,
+            file_count: proof.file_count,
+            logical_file_bytes: proof.logical_file_bytes,
+            object_count,
+            _guard: root.1,
+            object_bytes: self.object_bytes,
+        };
+        *cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(cached));
+        Ok(())
+    }
+}
+
+fn file_bytes(record: FileRecord) -> u128 {
+    match record.payload {
+        FilePayload::Regular { logical_bytes, .. } => u128::from(logical_bytes),
+        FilePayload::InlineRegular(bytes) => bytes.as_bytes().len() as u128,
+        _ => 0,
+    }
+}

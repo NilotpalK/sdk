@@ -104,6 +104,16 @@ fn retain(
         _allocation: allocation,
     };
     if entry.envelope().is_some() || entry.replay.is_some() {
+        if let Some(key) = &entry.replay {
+            let position = state.replays.partition_point(|index| {
+                state
+                    .retained
+                    .get(*index)
+                    .and_then(|entry| entry.replay.as_deref())
+                    .is_some_and(|stored| stored < key.as_ref())
+            });
+            state.replays.insert(position, state.retained.len());
+        }
         state.retained.push(entry);
     }
 }

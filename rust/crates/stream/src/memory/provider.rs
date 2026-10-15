@@ -93,7 +93,10 @@ impl StreamProvider for MemoryStream {
         if request.from > path.tail {
             return Err(StreamError::OutOfRange);
         }
-        let mut cursor = HistoryCursor::new(path.history.as_ref(), path.tail, request.from);
+        let end = path
+            .tail
+            .min(request.from.saturating_add(u64::from(request.limit)));
+        let mut cursor = HistoryCursor::new(path, end, request.from);
         Ok(stream::iter(
             std::iter::from_fn(move || cursor.next_record())
                 .take(request.limit as usize)
@@ -111,7 +114,7 @@ impl StreamProvider for MemoryStream {
             }
             (
                 stream.changed.subscribe(),
-                HistoryCursor::new(stream.history.as_ref(), stream.tail, from),
+                HistoryCursor::new(stream, stream.tail, from),
             )
         };
         let provider = self.clone();
@@ -271,15 +274,22 @@ impl StreamProvider for MemoryStream {
             let end = path
                 .tail
                 .min(request.from.saturating_add(u64::from(request.limit)));
-            let mut history = HistoryWalk::new(path.history.as_ref(), end, request.from);
-            while history.next.is_some() && history.ceiling > request.from {
+            if let Some(window) = path.prefix_window(request.from, end) {
                 meter.admit_examination(1, 0)?;
-                if let Some((History::Batch { records, .. }, ceiling)) = history.next()
-                    && let Some(window) = history_window(Arc::clone(records), ceiling, request.from)
-                {
-                    windows.push(window);
-                }
+                windows.push(window);
                 meter.record_examination(1, 0)?;
+            } else {
+                let mut history = HistoryWalk::new(path.history.as_ref(), end, request.from);
+                while history.next.is_some() && history.ceiling > request.from {
+                    meter.admit_examination(1, 0)?;
+                    if let Some((History::Batch { records, .. }, ceiling)) = history.next()
+                        && let Some(window) =
+                            history_window(Arc::clone(records), ceiling, request.from)
+                    {
+                        windows.push(window);
+                    }
+                    meter.record_examination(1, 0)?;
+                }
             }
             windows.reverse();
             let cursor_meter = Arc::clone(&meter);

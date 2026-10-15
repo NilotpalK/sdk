@@ -81,7 +81,7 @@ impl<'a> ProofMeter<'a> {
         }
     }
 
-    fn owned<T>(
+    pub(super) fn owned<T>(
         &self,
         operation: impl FnOnce(
             &mut crate::kernel::allocation::KernelAccounting<'_>,

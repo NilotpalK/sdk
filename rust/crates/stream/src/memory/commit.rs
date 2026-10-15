@@ -207,6 +207,7 @@ impl MemoryStream {
                 StreamPath(destination.0.slice(..end)),
                 PathState {
                     history: None,
+                    prefix: [None, None],
                     tail: 0,
                     changed,
                     _allocation: claim,
@@ -228,6 +229,18 @@ impl MemoryStream {
             buffer.append(&mut state.retained);
             state.retained = buffer;
             state.retained_allocation = claim;
+        }
+        let replay_needed = state
+            .replays
+            .len()
+            .checked_add(reserved(state).0)
+            .and_then(|len| len.checked_add(1))
+            .ok_or(StreamError::Capacity)?;
+        if replay_needed > state.replays.capacity() {
+            let (mut buffer, claim) = self.vector(replay_needed.next_power_of_two())?;
+            buffer.append(&mut state.replays);
+            state.replays = buffer;
+            state.replay_allocation = claim;
         }
         Ok(())
     }
@@ -419,7 +432,42 @@ fn publish_fact(
         CommittedMutation::Append(append) => (&append.path, append.tail),
         CommittedMutation::Fork(fork) => (&fork.destination, fork.tail),
     };
+    let source = match fact {
+        CommittedMutation::Append(append) => &append.path,
+        CommittedMutation::Fork(fork) => &fork.source,
+    };
+    let mut prefix = state
+        .paths
+        .get(source)
+        .map(|path| path.prefix.clone())
+        .unwrap_or([None, None]);
+    if let CommittedMutation::Fork(fork) = fact {
+        for (slot, sequence) in prefix.iter_mut().zip([0_u64, 1]) {
+            if sequence >= fork.forked_at {
+                *slot = None;
+            }
+        }
+    }
+    if let History::Batch { records, .. } = history.as_ref()
+        && let Some(first) = records.records.first()
+    {
+        for (slot, sequence) in prefix.iter_mut().zip([0_u64, 1]) {
+            if slot.is_none()
+                && let Some(index) = sequence
+                    .checked_sub(first.sequence)
+                    .and_then(|index| usize::try_from(index).ok())
+                    .filter(|&index| index < records.records.len())
+            {
+                *slot = Some(HistoryWindow {
+                    records: Arc::clone(records),
+                    start: index,
+                    end: index + 1,
+                });
+            }
+        }
+    }
     let stream = state.paths.get_mut(path).ok_or(StreamError::Unavailable)?;
+    stream.prefix = prefix;
     stream.history = Some(history);
     stream.tail = tail;
     stream.changed.send_replace(tail);

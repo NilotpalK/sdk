@@ -108,6 +108,9 @@ reqwest = { workspace = true, optional = true }
 tracing.workspace = true
 tokio = { version = "1.48.0", default-features = false, features = ["signal"] }
 
+[dev-dependencies]
+acyclic-objects = { version = "=0.2.0", path = "../objects", default-features = false }
+
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tracing-subscriber.workspace = true
 divan.workspace = true

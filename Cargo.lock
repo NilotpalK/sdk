@@ -248,6 +248,7 @@ dependencies = [
  "acyclic-native-runtime",
  "acyclic-objects",
  "acyclic-stream",
+ "arrayvec",
  "async-trait",
  "base64 0.22.1",
  "blake3",

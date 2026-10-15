@@ -8,7 +8,7 @@ use acyclic_harness::{
     wire_codec::{decode_command_envelope, encode_authority, encode_event_envelope},
 };
 use acyclic_stream::{BoxProviderFuture, BoxProviderStream};
-use futures::stream;
+use futures::{StreamExt, stream};
 impl NativeSession {
     async fn control(
         &self,
@@ -217,13 +217,53 @@ impl HarnessWireApi for NativeSession {
         Box::pin(async move {
             let control = validate_observe_request(&request)?;
             let coordinator = self.control(&control).await?;
-            Ok(operation_status(
+            let mut status = operation_status(
                 coordinator
                     .scheduler()
                     .operation(control.operation_id)
                     .ok_or_else(|| Error::NotFound("operation".into()))?,
-                self.replay_cut(&encode_authority(&control.owner)).await?,
+            );
+            status.replay_through = Some(self.replay_cut(&encode_authority(&control.owner)).await?);
+            Ok(status)
+        })
+    }
+    fn watch_operation<'a>(
+        &'a self,
+        request: wire::ObserveRequest,
+    ) -> BoxProviderFuture<'a, Result<BoxProviderStream<'static, Result<wire::OperationStatus>>>>
+    {
+        Box::pin(async move {
+            let control = validate_observe_request(&request)?;
+            let coordinator = self.control(&control).await?;
+            let source = coordinator.operation_changes(control.operation_id).await?;
+            let binding = self.binding(&encode_authority(&control.owner))?.clone();
+            let stream = self.stream.clone();
+            let generation = self.config.generation.clone();
+            Ok(Box::pin(stream::try_unfold(
+                (source, binding, stream, generation),
+                |(mut source, binding, stream, generation)| async move {
+                    let Some(mut status) = source.next().await.transpose()? else {
+                        return Ok(None);
+                    };
+                    let reader = HistoryReader::new(
+                        &stream,
+                        &binding.authority,
+                        &(binding.verifier()?),
+                        &mut None,
+                    )?;
+                    let pinned = reader.pin(0, None).await?;
+                    status.replay_through = Some(wire::ReplayCursor {
+                        authority: status.owner.clone(),
+                        generation: generation.clone(),
+                        revision: pinned.through_revision,
+                    });
+                    Ok(Some((status, (source, binding, stream, generation))))
+                },
             ))
+                as BoxProviderStream<
+                    'static,
+                    Result<wire::OperationStatus>,
+                >)
         })
     }
     fn cancel<'a>(
@@ -245,12 +285,13 @@ impl HarnessWireApi for NativeSession {
                     &mut None,
                 )
                 .await?;
+            let mut status = operation_status(&state);
+            status.replay_through = Some(
+                self.replay_cut(&encode_authority(&control.control.owner))
+                    .await?,
+            );
             Ok(wire::CancelResponse {
-                status: Some(operation_status(
-                    &state,
-                    self.replay_cut(&encode_authority(&control.control.owner))
-                        .await?,
-                )),
+                status: Some(status),
                 operation: Some(wire::OperationIdentity {
                     operation_id: control.control.operation_id.to_string(),
                     idempotency_key: control.idempotency_key.0,

@@ -115,6 +115,13 @@ impl HarnessWireApi for WireFixture {
         unavailable()
     }
 
+    fn watch_operation<'a>(
+        &'a self,
+        _: wire::ObserveRequest,
+    ) -> BoxProviderFuture<'a, Result<BoxProviderStream<'static, Result<wire::OperationStatus>>>>
+    {
+        unavailable()
+    }
     fn cancel<'a>(
         &'a self,
         _: wire::CancelRequest,

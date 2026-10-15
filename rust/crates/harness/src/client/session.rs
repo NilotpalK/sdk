@@ -165,6 +165,32 @@ impl<S: ClientStateStore> ClientSession<S> {
         Ok(acknowledge)
     }
 
+    pub(super) fn receive_delivery(
+        &mut self,
+        delivery: wire::Delivery,
+        before_commit: impl FnOnce(&wire::ServerFrame) -> Result<()>,
+    ) -> Result<wire::Delivery> {
+        let record = SessionRecord {
+            request: None,
+            response: Some(wire::ServerFrame {
+                frame: Some(wire::server_frame::Frame::Delivery(delivery)),
+            }),
+            checkpoint: None,
+        };
+        let Some(wire::ServerFrame {
+            frame: Some(wire::server_frame::Frame::Delivery(delivery)),
+        }) = record.response.as_ref()
+        else {
+            return Err(Error::Storage("delivery record missing".into()));
+        };
+        self.deliver(delivery, &record, true, before_commit)?;
+        self.compact_if_needed()?;
+        match record.response.and_then(|response| response.frame) {
+            Some(wire::server_frame::Frame::Delivery(delivery)) => Ok(delivery),
+            _ => Err(Error::Storage("delivery record missing".into())),
+        }
+    }
+
     /// Exact resume request, including the compiled protocol identity.
     #[must_use]
     pub fn resume(&self) -> wire::ResumeRequest {
@@ -249,7 +275,7 @@ impl<S: ClientStateStore> ClientSession<S> {
                     self.admit(admission, record, persist)?;
                 }
                 Some(wire::server_frame::Frame::Delivery(delivery)) => {
-                    self.deliver(delivery, record, persist)?;
+                    self.deliver(delivery, record, persist, |_| Ok(()))?;
                 }
                 _ => return Err(Error::Invalid("unsupported client journal response".into())),
             },
@@ -388,6 +414,7 @@ impl<S: ClientStateStore> ClientSession<S> {
         delivery: &wire::Delivery,
         record: &SessionRecord,
         persist: bool,
+        before_commit: impl FnOnce(&wire::ServerFrame) -> Result<()>,
     ) -> Result<()> {
         let authority = valid_authority(delivery.authority.as_ref())?;
         let key = authority_key(authority);
@@ -423,6 +450,12 @@ impl<S: ClientStateStore> ClientSession<S> {
             return Err(Error::Conflict("delivery is not contiguous".into()));
         }
         if delivery.through_revision <= cursor.revision {
+            before_commit(
+                record
+                    .response
+                    .as_ref()
+                    .ok_or_else(|| Error::Storage("delivery record missing".into()))?,
+            )?;
             return Ok(());
         }
         if delivery.from_revision != cursor.revision {
@@ -430,6 +463,12 @@ impl<S: ClientStateStore> ClientSession<S> {
                 "delivery does not follow durable cursor".into(),
             ));
         }
+        before_commit(
+            record
+                .response
+                .as_ref()
+                .ok_or_else(|| Error::Storage("delivery record missing".into()))?,
+        )?;
         if persist {
             self.append_record(record)?;
         }

@@ -528,3 +528,44 @@ async fn projector_reads_bounded_verified_coordinator_pages() -> Result<()> {
     assert_eq!(reopened.revision, 3);
     Ok(())
 }
+
+#[tokio::test]
+async fn operation_watch_is_gapless_and_wakes_without_owner_history() -> Result<()> {
+    use futures::{FutureExt, StreamExt};
+    let client = Arc::new(MemoryStream::default());
+    let operation = OperationId::from_bytes([92; 16]);
+    let mut coordinator = open(&client).await?;
+    declare(&mut coordinator, spec(operation, 0)?, "watch-declare").await?;
+    let mut updates = open(&client).await?.operation_changes(operation).await?;
+    // Commit between subscribing and consuming the snapshot.
+    publish(
+        &mut coordinator,
+        "watch-cancel",
+        SchedulerEvent::CancellationRequested {
+            operation_id: operation,
+            recursive: false,
+        },
+    )
+    .await?;
+    let initial = updates.next().await.expect("initial snapshot")?;
+    assert!(!initial.cancellation_requested);
+    let changed = updates
+        .next()
+        .now_or_never()
+        .expect("no delivery required")
+        .expect("scheduler change")?;
+    assert!(changed.cancellation_requested);
+    assert!(changed.revision > initial.revision);
+    assert!(updates.next().now_or_never().is_none());
+    declare(
+        &mut coordinator,
+        spec(OperationId::from_bytes([93; 16]), 0)?,
+        "watch-unrelated",
+    )
+    .await?;
+    assert!(
+        updates.next().now_or_never().is_none(),
+        "unrelated operation is not emitted"
+    );
+    Ok(())
+}

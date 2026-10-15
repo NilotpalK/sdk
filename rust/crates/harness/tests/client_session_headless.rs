@@ -86,14 +86,7 @@ async fn every_settled_outcome_has_its_documented_exit_code() {
         assert_eq!(outcome, expected);
         assert_eq!(outcome.exit_code(), exit_code);
         let frames = frames(output);
-        assert_eq!(
-            frames.len(),
-            if expected == HeadlessOutcome::Blocked {
-                5
-            } else {
-                4
-            }
-        );
+        assert_eq!(frames.len(), 4);
         assert!(matches!(
             frames[0].frame,
             Some(wire::server_frame::Frame::Handshake(_))
@@ -617,4 +610,196 @@ fn large_checkpoint_bulk_restores_ordered_outbox_and_identity_indexes() {
         store.replace(&invalid).unwrap();
         assert!(ClientSession::open(store).is_err());
     }
+}
+
+#[tokio::test]
+async fn late_settlement_wakes_without_another_history_delivery() {
+    for live in [false, true] {
+        let host = Arc::new(Host::default());
+        trace(
+            &host,
+            &[LifecycleState::Active],
+            wire::CompletionState::Running,
+        );
+        if live {
+            let replay = host.trace.lock().unwrap().take().unwrap();
+            *host.trace.lock().unwrap() = Some(Box::pin(replay.chain(futures::stream::pending())));
+        }
+        let mut client = HarnessClient::connect(host.clone(), session())
+            .await
+            .unwrap();
+        let mut output = Vec::new();
+        {
+            let mut runner = Box::pin(run_headless(&mut client, command(), target(), &mut output));
+            assert!(runner.as_mut().now_or_never().is_none());
+            host.complete(wire::CompletionState::Succeeded);
+            assert_eq!(
+                runner
+                    .as_mut()
+                    .now_or_never()
+                    .expect("status change wakes runner")
+                    .unwrap(),
+                HeadlessOutcome::Completed
+            );
+        }
+        assert_eq!(
+            frames(output)
+                .iter()
+                .filter(|frame| matches!(frame.frame, Some(wire::server_frame::Frame::Delivery(_))))
+                .count(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn stdin_eof_during_ack_cannot_overtake_jsonl_delivery() {
+    let host = Arc::new(Host::default());
+    trace(
+        &host,
+        &[LifecycleState::Completed],
+        wire::CompletionState::Succeeded,
+    );
+    let (eof_sender, eof_receiver) = futures::channel::oneshot::channel();
+    let (release_sender, release_receiver) = futures::channel::oneshot::channel();
+    *host.ack_input_eof.lock().unwrap() = Some(eof_sender);
+    *host.ack_release.lock().unwrap() = Some(release_receiver);
+    let input = futures::stream::unfold(Some(eof_receiver), |mut receiver| async move {
+        if let Some(receiver) = receiver.take() {
+            receiver.await.unwrap();
+        }
+        None::<(
+            Result<String>,
+            Option<futures::channel::oneshot::Receiver<()>>,
+        )>
+    })
+    .boxed();
+    let mut client = HarnessClient::connect(host.clone(), session())
+        .await
+        .unwrap();
+    let mut output = Vec::new();
+    {
+        let mut runner = Box::pin(run_jsonl(&mut client, target(), input, &mut output));
+        assert!(
+            runner.as_mut().now_or_never().is_none(),
+            "ack is pending after EOF"
+        );
+        release_sender.send(()).unwrap();
+        assert_eq!(
+            runner
+                .as_mut()
+                .now_or_never()
+                .expect("released acknowledgement")
+                .unwrap(),
+            HeadlessOutcome::Completed
+        );
+    }
+    assert_eq!(client.session().resume().cursors[0].revision, 1);
+    assert!(
+        frames(output)
+            .iter()
+            .any(|frame| matches!(frame.frame, Some(wire::server_frame::Frame::Delivery(_))))
+    );
+    assert_eq!(host.acknowledgements.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn buffered_committed_delivery_is_drained_before_settlement() {
+    let host = Arc::new(Host::default());
+    trace(
+        &host,
+        &[LifecycleState::Completed],
+        wire::CompletionState::Succeeded,
+    );
+    let mut client = HarnessClient::connect(host.clone(), session())
+        .await
+        .unwrap();
+    client.replay().await.unwrap();
+    host.hold_ack.store(true, Ordering::Relaxed);
+    assert!(client.next_delivery().now_or_never().is_none());
+    host.hold_ack.store(false, Ordering::Relaxed);
+    let mut output = Vec::new();
+    assert_eq!(
+        run_jsonl(&mut client, target(), futures::stream::empty(), &mut output)
+            .await
+            .unwrap(),
+        HeadlessOutcome::Completed
+    );
+    assert!(
+        frames(output)
+            .iter()
+            .any(|frame| matches!(frame.frame, Some(wire::server_frame::Frame::Delivery(_))))
+    );
+}
+
+#[tokio::test]
+async fn fresh_jsonl_target_is_admitted_before_status_is_required() {
+    let host = Arc::new(Host::default());
+    host.requires_admission.store(true, Ordering::Relaxed);
+    *host.state.lock().unwrap() = Some(wire::CompletionState::Running);
+    let (sender, receiver) = futures::channel::mpsc::unbounded();
+    *host.trace.lock().unwrap() = Some(Box::pin(receiver));
+    *host.live_sender.lock().unwrap() = Some(sender);
+    *host.submit_delivery.lock().unwrap() = Some(delivery(0, LifecycleState::Completed));
+    assert!(matches!(
+        host.observe(target()).await,
+        Err(Error::NotFound(_))
+    ));
+    let mut client = HarnessClient::connect(host.clone(), session())
+        .await
+        .unwrap();
+    let input = futures::stream::iter([Ok(jsonl::client_frame(&wire::ClientFrame {
+        frame: Some(wire::client_frame::Frame::Command(command())),
+    })
+    .unwrap())]);
+    let mut output = Vec::new();
+    assert_eq!(
+        run_jsonl(&mut client, target(), input, &mut output)
+            .await
+            .unwrap(),
+        HeadlessOutcome::Completed
+    );
+    assert_eq!(host.commands.lock().unwrap().as_slice(), &[command()]);
+    let output = frames(output);
+    assert!(
+        output
+            .iter()
+            .any(|frame| matches!(frame.frame, Some(wire::server_frame::Frame::Admission(_))))
+    );
+    assert!(
+        output
+            .iter()
+            .any(|frame| matches!(frame.frame, Some(wire::server_frame::Frame::Delivery(_))))
+    );
+}
+
+#[tokio::test]
+async fn failed_jsonl_write_never_commits_or_acknowledges_the_delivery() {
+    struct FailDelivery;
+    impl Write for FailDelivery {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.starts_with(b"{\"delivery\"") {
+                return Err(std::io::Error::other("stdout closed"));
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let host = Arc::new(Host::default());
+    trace(
+        &host,
+        &[LifecycleState::Completed],
+        wire::CompletionState::Succeeded,
+    );
+    let mut client = HarnessClient::connect(host.clone(), session())
+        .await
+        .unwrap();
+    assert!(matches!(
+        run_headless(&mut client, command(), target(), &mut FailDelivery).await,
+        Err(Error::Storage(_))
+    ));
+    assert_eq!(client.session().resume().cursors[0].revision, 0);
+    assert!(host.acknowledgements.lock().unwrap().is_empty());
 }

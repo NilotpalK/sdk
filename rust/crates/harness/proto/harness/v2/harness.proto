@@ -242,6 +242,7 @@ service HarnessService {
   rpc Submit(CommandEnvelope) returns (Admission);
   rpc Replay(ResumeRequest) returns (stream Delivery);
   rpc Observe(ObserveRequest) returns (OperationStatus);
+  rpc WatchOperation(ObserveRequest) returns (stream OperationStatus);
   rpc Cancel(CancelRequest) returns (CancelResponse);
 }
 

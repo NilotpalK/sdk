@@ -104,20 +104,33 @@ impl<S: ClientStateStore> HarnessClient<S> {
 
     /// Validates and durably publishes the next complete delivery.
     pub async fn next_delivery(&mut self) -> Result<Option<wire::Delivery>> {
-        if self.buffered_delivery.is_none() {
-            let stream = self
-                .deliveries
-                .as_mut()
-                .ok_or_else(|| Error::Invalid("open replay before reading deliveries".into()))?;
-            let Some(delivery) = stream.next().await else {
-                return Ok(None);
-            };
-            let delivery = delivery?;
-            self.session.receive(wire::ServerFrame {
-                frame: Some(wire::server_frame::Frame::Delivery(delivery.clone())),
-            })?;
-            self.buffered_delivery = Some(delivery);
+        match self.read_delivery().await? {
+            Some(delivery) => self.publish_delivery(delivery, |_| Ok(())).await.map(Some),
+            None => Ok(None),
         }
+    }
+
+    pub(super) fn has_buffered_delivery(&self) -> bool {
+        self.buffered_delivery.is_some()
+    }
+
+    pub(super) async fn read_delivery(&mut self) -> Result<Option<wire::Delivery>> {
+        if let Some(delivery) = self.buffered_delivery.take() {
+            return Ok(Some(delivery));
+        }
+        let stream = self
+            .deliveries
+            .as_mut()
+            .ok_or_else(|| Error::Invalid("open replay before reading deliveries".into()))?;
+        stream.next().await.transpose()
+    }
+
+    pub(super) async fn publish_delivery(
+        &mut self,
+        delivery: wire::Delivery,
+        before_commit: impl FnOnce(&wire::ServerFrame) -> Result<()>,
+    ) -> Result<wire::Delivery> {
+        self.buffered_delivery = Some(self.session.receive_delivery(delivery, before_commit)?);
         if let Some(delivery) = self.buffered_delivery.as_ref() {
             self.api
                 .acknowledge(wire::Acknowledge {
@@ -127,7 +140,23 @@ impl<S: ClientStateStore> HarnessClient<S> {
                 })
                 .await?;
         }
-        Ok(self.buffered_delivery.take())
+        self.buffered_delivery
+            .take()
+            .ok_or_else(|| Error::Conflict("committed delivery disappeared".into()))
+    }
+
+    /// Subscribes to status changes independently of owner-history replay.
+    pub async fn operation_updates(
+        &self,
+        request: wire::ObserveRequest,
+    ) -> Result<BoxProviderStream<'static, Result<wire::OperationStatus>>> {
+        crate::wire_api::validate_observe_request(&request)?;
+        let stream = self.api.watch_operation(request.clone()).await?;
+        Ok(Box::pin(stream.map(move |status| {
+            let status = status?;
+            validate_operation_status(&request.operation_id, request.owner.as_ref(), &status)?;
+            Ok(status)
+        })))
     }
 
     /// Observes an identity-bound operation projection.

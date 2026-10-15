@@ -141,6 +141,31 @@ impl transport::harness_service_server::HarnessService for HarnessGrpcService {
         )
     }
 
+    type WatchOperationStream = BoxStream<'static, Result<wire::OperationStatus, Status>>;
+
+    async fn watch_operation(
+        &self,
+        request: Request<wire::ObserveRequest>,
+    ) -> Result<Response<Self::WatchOperationStream>, Status> {
+        let control = validate_observe_request(request.get_ref()).map_err(status)?;
+        self.api
+            .authorize_operation_control(&control)
+            .await
+            .map_err(status)?;
+        let request = request.into_inner();
+        let stream = self
+            .api
+            .watch_operation(request.clone())
+            .await
+            .map_err(status)?;
+        Ok(Response::new(Box::pin(stream.map(move |item| {
+            let response = item.map_err(wire_status)?;
+            validate_operation_status(&request.operation_id, request.owner.as_ref(), &response)
+                .map_err(wire_status)?;
+            Ok(response)
+        }))))
+    }
+
     #[cfg_attr(
         not(target_arch = "wasm32"),
         tracing::instrument(
@@ -300,6 +325,18 @@ mod tests {
             .boxed()
         }
 
+        fn watch_operation<'a>(
+            &'a self,
+            request: wire::ObserveRequest,
+        ) -> futures::future::BoxFuture<'a, Result<BoxStream<'static, Result<wire::OperationStatus>>>>
+        {
+            Box::pin(async move {
+                let status = self.observe(request).await?;
+                Ok(Box::pin(stream::iter([Ok(status)]))
+                    as BoxStream<'static, Result<wire::OperationStatus>>)
+            })
+        }
+
         fn cancel<'a>(
             &'a self,
             request: wire::CancelRequest,
@@ -388,6 +425,26 @@ mod tests {
             observed.operation.map(|value| value.operation_id),
             Some(operation_id.clone())
         );
+
+        let update = service
+            .watch_operation(Request::new(wire::ObserveRequest {
+                protocol: Some(current_protocol()),
+                owner: Some(owner.clone()),
+                operation_id: operation_id.clone(),
+                scope: Some(scope.clone()),
+            }))
+            .await
+            .map_err(|error| Error::Storage(error.to_string()))?
+            .into_inner()
+            .next()
+            .await
+            .ok_or_else(|| Error::Storage("missing operation update".into()))?
+            .map_err(|error| Error::Storage(error.to_string()))?;
+        assert_eq!(
+            update.operation.as_ref().map(|value| &value.operation_id),
+            Some(&operation_id)
+        );
+        assert_eq!(update.owner.as_ref(), Some(&owner));
 
         let operation = wire::OperationIdentity {
             operation_id: operation_id.clone(),

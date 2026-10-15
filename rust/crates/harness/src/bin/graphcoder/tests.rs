@@ -77,6 +77,13 @@ impl HarnessWireApi for Probe {
         async { Err(Error::Unsupported("unused".into())) }.boxed()
     }
 
+    fn watch_operation<'a>(
+        &'a self,
+        _: wire::ObserveRequest,
+    ) -> BoxProviderFuture<'a, Result<BoxProviderStream<'static, Result<wire::OperationStatus>>>>
+    {
+        Box::pin(async { Err(Error::Unsupported("probe".into())) })
+    }
     fn cancel<'a>(
         &'a self,
         _: wire::CancelRequest,

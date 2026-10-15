@@ -3621,6 +3621,14 @@ export declare const HarnessService: GenService<{
     output: typeof OperationStatusSchema;
   },
   /**
+   * @generated from rpc acyclic.harness.v2.HarnessService.WatchOperation
+   */
+  watchOperation: {
+    methodKind: "server_streaming";
+    input: typeof ObserveRequestSchema;
+    output: typeof OperationStatusSchema;
+  },
+  /**
    * @generated from rpc acyclic.harness.v2.HarnessService.Cancel
    */
   cancel: {

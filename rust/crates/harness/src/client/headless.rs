@@ -2,6 +2,7 @@
 
 use super::{ClientStateStore, HarnessClient, jsonl, views::authority_key};
 use crate::{Error, Result, core::LifecycleState, wire};
+use acyclic_stream::BoxProviderStream;
 use futures::{FutureExt, Stream, StreamExt};
 use std::io::Write;
 
@@ -35,7 +36,11 @@ impl HeadlessOutcome {
 }
 
 fn emit(output: &mut impl Write, frame: wire::server_frame::Frame) -> Result<()> {
-    let mut line = jsonl::server_frame(&wire::ServerFrame { frame: Some(frame) })?;
+    emit_frame(output, &wire::ServerFrame { frame: Some(frame) })
+}
+
+fn emit_frame(output: &mut impl Write, frame: &wire::ServerFrame) -> Result<()> {
+    let mut line = jsonl::server_frame(frame)?;
     line.push('\n');
     output
         .write_all(line.as_bytes())
@@ -86,12 +91,7 @@ pub async fn run_headless<S: ClientStateStore>(
             let state = admission.state;
             emit(output, wire::server_frame::Frame::Admission(admission))?;
             if target_admission {
-                if state == wire::AdmissionState::Rejected as i32 {
-                    outcome = Some(HeadlessOutcome::Failed);
-                }
-                if state == wire::AdmissionState::Indeterminate as i32 {
-                    outcome = Some(HeadlessOutcome::Indeterminate);
-                }
+                outcome = admission_outcome(state);
             }
             Ok(())
         })
@@ -100,7 +100,7 @@ pub async fn run_headless<S: ClientStateStore>(
         return Ok(outcome);
     }
     client.replay().await?;
-    follow(client, &target, futures::stream::empty(), output).await
+    follow(client, &target, futures::stream::empty(), output, true).await
 }
 
 /// Reads wire command frames from JSONL stdin while continuing to stream replay.
@@ -116,16 +116,40 @@ pub async fn run_jsonl<S: ClientStateStore>(
         output,
         wire::server_frame::Frame::Handshake(client.handshake().clone()),
     )?;
+    let mut admitted = false;
+    let mut outcome = None;
     client
-        .flush_outbox(|admission| emit(output, wire::server_frame::Frame::Admission(admission)))
+        .flush_outbox(|admission| {
+            if admission
+                .operation
+                .as_ref()
+                .is_some_and(|identity| identity.operation_id == target.operation_id)
+            {
+                admitted = admission.state == wire::AdmissionState::Accepted as i32;
+                outcome = admission_outcome(admission.state);
+            }
+            emit(output, wire::server_frame::Frame::Admission(admission))
+        })
         .await?;
+    if let Some(outcome) = outcome {
+        return Ok(outcome);
+    }
     client.replay().await?;
-    follow(client, &target, input, output).await
+    follow(client, &target, input, output, admitted).await
+}
+
+fn admission_outcome(state: i32) -> Option<HeadlessOutcome> {
+    match wire::AdmissionState::try_from(state).ok()? {
+        wire::AdmissionState::Rejected => Some(HeadlessOutcome::Failed),
+        wire::AdmissionState::Indeterminate => Some(HeadlessOutcome::Indeterminate),
+        _ => None,
+    }
 }
 
 enum Incoming {
     Command(Option<Result<String>>),
     Delivery(Result<Option<wire::Delivery>>),
+    Status(Option<Result<wire::OperationStatus>>),
 }
 
 async fn follow<S: ClientStateStore>(
@@ -133,69 +157,151 @@ async fn follow<S: ClientStateStore>(
     target: &wire::ObserveRequest,
     mut input: impl Stream<Item = Result<String>> + Unpin,
     output: &mut impl Write,
+    mut admitted: bool,
 ) -> Result<HeadlessOutcome> {
     let mut input_open = true;
-    let mut ended = false;
-    let mut status = observe(client, target, output).await?;
+    let mut replay_ended = false;
+    let mut status = None;
+    let mut updates = subscribe(client, target, admitted).await?;
     loop {
-        let caught_up = reached(client, &status)?;
-        if caught_up {
-            if let Some(outcome) = completion(&status) {
-                return Ok(outcome);
+        if let Some(current) = &status {
+            let caught_up = reached(client, current)?;
+            if caught_up && !client.has_buffered_delivery() {
+                if let Some(outcome) = completion(current) {
+                    return Ok(outcome);
+                }
+                let task = target
+                    .owner
+                    .as_ref()
+                    .and_then(|owner| client.session().views().tasks.get(&authority_key(owner)));
+                if task.is_some_and(|task| task.status == LifecycleState::Waiting) {
+                    return Ok(HeadlessOutcome::Blocked);
+                }
+                if updates.is_none() {
+                    return Err(indeterminate(target)?);
+                }
             }
-            let task = target
-                .owner
-                .as_ref()
-                .and_then(|owner| client.session().views().tasks.get(&authority_key(owner)));
-            if task.is_some_and(|task| task.status == LifecycleState::Waiting) {
-                return Ok(HeadlessOutcome::Blocked);
+            if !caught_up && replay_ended && !client.has_buffered_delivery() {
+                return Err(indeterminate(target)?);
             }
+        } else if updates.is_none() && !input_open {
+            return Err(if admitted {
+                indeterminate(target)?
+            } else {
+                Error::NotFound("operation was not submitted".into())
+            });
         }
-        if ended {
-            return Err(Error::Indeterminate(crate::OperationId::parse(
-                &target.operation_id,
-            )?));
-        }
-        let incoming = if input_open {
-            let command = input.next().fuse();
-            let delivery = client.next_delivery().fuse();
-            futures::pin_mut!(command, delivery);
-            futures::select! {
-                line = command => Incoming::Command(line),
-                frame = delivery => Incoming::Delivery(frame),
-            }
-        } else {
-            Incoming::Delivery(client.next_delivery().await)
-        };
+        let incoming =
+            next_incoming(client, &mut updates, &mut input, input_open, replay_ended).await;
         match incoming {
+            Incoming::Status(Some(change)) => {
+                let change = change?;
+                let frame = wire::ServerFrame {
+                    frame: Some(wire::server_frame::Frame::Status(change)),
+                };
+                emit_frame(output, &frame)?;
+                if let Some(wire::server_frame::Frame::Status(change)) = frame.frame {
+                    status = Some(change);
+                }
+            }
+            Incoming::Status(None) => updates = None,
             Incoming::Command(Some(line)) => {
-                dispatch(client, jsonl::parse_client_frame(&line?)?, output).await?;
-                status = observe(client, target, output).await?;
+                let frame = jsonl::parse_client_frame(&line?)?;
+                let resume = matches!(frame.frame, Some(wire::client_frame::Frame::Resume(_)));
+                if let Some(state) = dispatch(client, frame, target, output).await? {
+                    match state {
+                        wire::AdmissionState::Rejected => return Ok(HeadlessOutcome::Failed),
+                        wire::AdmissionState::Indeterminate => {
+                            return Ok(HeadlessOutcome::Indeterminate);
+                        }
+                        wire::AdmissionState::Accepted => {
+                            admitted = true;
+                            if replay_ended {
+                                client.replay().await?;
+                                replay_ended = false;
+                            }
+                        }
+                        wire::AdmissionState::Unspecified => {
+                            return Err(Error::Conflict("unspecified admission".into()));
+                        }
+                    }
+                    if updates.is_none() {
+                        updates = subscribe(client, target, admitted).await?;
+                    }
+                }
+                if resume {
+                    replay_ended = false;
+                }
             }
             Incoming::Command(None) => input_open = false,
-            Incoming::Delivery(delivery) => {
-                match delivery? {
-                    Some(delivery) => emit(output, wire::server_frame::Frame::Delivery(delivery))?,
-                    None => ended = true,
+            Incoming::Delivery(delivery) => match delivery? {
+                Some(delivery) => {
+                    // A complete validated frame reaches stdout before its cursor commits.
+                    // Neither stdin EOF nor a status update can cancel commit/acknowledgement.
+                    client
+                        .publish_delivery(delivery, |frame| emit_frame(output, frame))
+                        .await?;
                 }
-                // Freeze each observed cut while catching up. Scheduler revisions
-                // and aggregate revisions are independent; only this cursor is a fence.
-                if caught_up || (completion(&status).is_none() && reached(client, &status)?) {
-                    status = observe(client, target, output).await?;
-                }
-            }
+                None => replay_ended = true,
+            },
         }
     }
 }
 
-async fn observe<S: ClientStateStore>(
+async fn next_incoming<S: ClientStateStore>(
+    client: &mut HarnessClient<S>,
+    updates: &mut Option<BoxProviderStream<'static, Result<wire::OperationStatus>>>,
+    input: &mut (impl Stream<Item = Result<String>> + Unpin),
+    input_open: bool,
+    replay_ended: bool,
+) -> Incoming {
+    let change = async {
+        match updates.as_mut() {
+            Some(stream) => stream.next().await,
+            None => futures::future::pending().await,
+        }
+    }
+    .fuse();
+    let command = async {
+        if input_open {
+            input.next().await
+        } else {
+            futures::future::pending().await
+        }
+    }
+    .fuse();
+    let delivery = async {
+        if !replay_ended || client.has_buffered_delivery() {
+            client.read_delivery().await
+        } else {
+            futures::future::pending().await
+        }
+    }
+    .fuse();
+    futures::pin_mut!(change, command, delivery);
+    futures::select_biased! {
+        status = change => Incoming::Status(status),
+        line = command => Incoming::Command(line),
+        frame = delivery => Incoming::Delivery(frame),
+    }
+}
+
+async fn subscribe<S: ClientStateStore>(
     client: &HarnessClient<S>,
     target: &wire::ObserveRequest,
-    output: &mut impl Write,
-) -> Result<wire::OperationStatus> {
-    let status = client.observe(target.clone()).await?;
-    emit(output, wire::server_frame::Frame::Status(status.clone()))?;
-    Ok(status)
+    admitted: bool,
+) -> Result<Option<BoxProviderStream<'static, Result<wire::OperationStatus>>>> {
+    match client.operation_updates(target.clone()).await {
+        Ok(stream) => Ok(Some(stream)),
+        Err(Error::NotFound(_)) if !admitted => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn indeterminate(target: &wire::ObserveRequest) -> Result<Error> {
+    Ok(Error::Indeterminate(crate::OperationId::parse(
+        &target.operation_id,
+    )?))
 }
 
 fn reached<S: ClientStateStore>(
@@ -225,15 +331,31 @@ fn reached<S: ClientStateStore>(
 async fn dispatch<S: ClientStateStore>(
     client: &mut HarnessClient<S>,
     frame: wire::ClientFrame,
+    target: &wire::ObserveRequest,
     output: &mut impl Write,
-) -> Result<()> {
+) -> Result<Option<wire::AdmissionState>> {
     use wire::client_frame::Frame;
+    let mut admission = None;
     let response = match frame
         .frame
         .ok_or_else(|| Error::Invalid("empty input frame".into()))?
     {
         Frame::Command(command) => {
-            wire::server_frame::Frame::Admission(client.submit(command).await?)
+            let is_target = command
+                .operation
+                .as_ref()
+                .is_some_and(|identity| identity.operation_id == target.operation_id);
+            if is_target && command.authority != target.owner {
+                return Err(Error::Invalid("headless command owner differs".into()));
+            }
+            let response = client.submit(command).await?;
+            if is_target {
+                admission = Some(
+                    wire::AdmissionState::try_from(response.state)
+                        .map_err(|error| Error::Conflict(error.to_string()))?,
+                );
+            }
+            wire::server_frame::Frame::Admission(response)
         }
         Frame::Observe(request) => {
             wire::server_frame::Frame::Status(client.observe(request).await?)
@@ -272,7 +394,7 @@ async fn dispatch<S: ClientStateStore>(
                 }
             }
             client.replay().await?;
-            return Ok(());
+            return Ok(None);
         }
         Frame::Acknowledge(ack) => {
             if !client.session().resume().cursors.iter().any(|cursor| {
@@ -284,8 +406,9 @@ async fn dispatch<S: ClientStateStore>(
                     "stdin acknowledgement exceeds durable cursor".into(),
                 ));
             }
-            return Ok(());
+            return Ok(None);
         }
     };
-    emit(output, response)
+    emit(output, response)?;
+    Ok(admission)
 }

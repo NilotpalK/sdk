@@ -236,17 +236,74 @@ struct Host {
     through: AtomicUsize,
     live_sender: Mutex<Option<futures::channel::mpsc::UnboundedSender<Result<wire::Delivery>>>>,
     submit_delivery: Mutex<Option<wire::Delivery>>,
+    status_sender: Mutex<
+        Option<(
+            wire::ObserveRequest,
+            futures::channel::mpsc::UnboundedSender<Result<wire::OperationStatus>>,
+        )>,
+    >,
+    requires_admission: AtomicBool,
+    ack_input_eof: Mutex<Option<futures::channel::oneshot::Sender<()>>>,
+    ack_release: Mutex<Option<futures::channel::oneshot::Receiver<()>>>,
+}
+impl Host {
+    fn snapshot(&self, request: wire::ObserveRequest) -> Result<wire::OperationStatus> {
+        if self.requires_admission.load(Ordering::Relaxed)
+            && !self.commands.lock().unwrap().iter().any(|command| {
+                command
+                    .operation
+                    .as_ref()
+                    .is_some_and(|identity| identity.operation_id == request.operation_id)
+            })
+        {
+            return Err(Error::NotFound("operation".into()));
+        }
+        Ok(wire::OperationStatus {
+            protocol: Some(current_protocol()),
+            replay_through: Some(wire::ReplayCursor {
+                authority: request.owner.clone(),
+                generation: "generation".into(),
+                revision: self.through.load(Ordering::Relaxed) as u64,
+            }),
+            owner: request.owner,
+            operation: Some(wire::OperationIdentity {
+                operation_id: request.operation_id,
+                idempotency_key: String::new(),
+            }),
+            state: self
+                .state
+                .lock()
+                .unwrap()
+                .unwrap_or(wire::CompletionState::Succeeded) as i32,
+            ..Default::default()
+        })
+    }
+    fn complete(&self, state: wire::CompletionState) {
+        let sender = self.status_sender.lock().unwrap();
+        *self.state.lock().unwrap() = Some(state);
+        if let Some((request, sender)) = sender.as_ref() {
+            let _ = sender.unbounded_send(self.snapshot(request.clone()));
+        }
+    }
 }
 impl HarnessWireApi for Host {
     fn acknowledge(&self, request: wire::Acknowledge) -> BoxProviderFuture<'_, Result<()>> {
         Box::pin(async move {
+            let eof = self.ack_input_eof.lock().unwrap().take();
+            if let Some(eof) = eof {
+                let _ = eof.send(());
+            }
+            let release = self.ack_release.lock().unwrap().take();
+            if let Some(release) = release {
+                release.await.unwrap();
+            }
             if self.hold_ack.load(Ordering::Relaxed) {
                 std::future::pending::<()>().await;
             }
             if request.through_revision == self.through.load(Ordering::Relaxed) as u64
                 && self.complete_on_ack.swap(false, Ordering::Relaxed)
             {
-                *self.state.lock().unwrap() = Some(wire::CompletionState::Succeeded);
+                self.complete(wire::CompletionState::Succeeded);
             }
             self.acknowledgements
                 .lock()
@@ -280,7 +337,7 @@ impl HarnessWireApi for Host {
             if let Some(delivery) = self.submit_delivery.lock().unwrap().take() {
                 self.through
                     .store(delivery.through_revision as usize, Ordering::Relaxed);
-                *self.state.lock().unwrap() = Some(wire::CompletionState::Succeeded);
+                self.complete(wire::CompletionState::Succeeded);
                 self.live_sender
                     .lock()
                     .unwrap()
@@ -318,26 +375,24 @@ impl HarnessWireApi for Host {
         &self,
         request: wire::ObserveRequest,
     ) -> BoxProviderFuture<'_, Result<wire::OperationStatus>> {
+        Box::pin(async move { self.snapshot(request) })
+    }
+    fn watch_operation(
+        &self,
+        request: wire::ObserveRequest,
+    ) -> BoxProviderFuture<'_, Result<BoxProviderStream<'static, Result<wire::OperationStatus>>>>
+    {
         Box::pin(async move {
-            Ok(wire::OperationStatus {
-                protocol: Some(current_protocol()),
-                replay_through: Some(wire::ReplayCursor {
-                    authority: request.owner.clone(),
-                    generation: "generation".into(),
-                    revision: self.through.load(Ordering::Relaxed) as u64,
-                }),
-                owner: request.owner,
-                operation: Some(wire::OperationIdentity {
-                    operation_id: request.operation_id,
-                    idempotency_key: String::new(),
-                }),
-                state: self
-                    .state
-                    .lock()
-                    .unwrap()
-                    .unwrap_or(wire::CompletionState::Succeeded) as i32,
-                ..Default::default()
-            })
+            let mut slot = self.status_sender.lock().unwrap();
+            let initial = self.snapshot(request.clone())?;
+            let (sender, receiver) = futures::channel::mpsc::unbounded();
+            sender.unbounded_send(Ok(initial)).unwrap();
+            *slot = Some((request, sender));
+            Ok(Box::pin(receiver)
+                as BoxProviderStream<
+                    'static,
+                    Result<wire::OperationStatus>,
+                >)
         })
     }
     fn cancel(
@@ -345,8 +400,8 @@ impl HarnessWireApi for Host {
         request: wire::CancelRequest,
     ) -> BoxProviderFuture<'_, Result<wire::CancelResponse>> {
         Box::pin(async move {
-            *self.state.lock().unwrap() = Some(wire::CompletionState::Cancelled);
             self.through.store(1, Ordering::Relaxed);
+            self.complete(wire::CompletionState::Cancelled);
             if let Some(sender) = self.live_sender.lock().unwrap().as_ref() {
                 sender
                     .unbounded_send(Ok(delivery(0, LifecycleState::Cancelled)))

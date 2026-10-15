@@ -21,14 +21,16 @@ pub use hypothesis::{Begin, Hypothesis, Provenance, View};
 mod kernel;
 pub use kernel::Client;
 mod session;
-pub use session::{ClientSession, ClientStateStore, MemoryClientState, SessionCheckpoint, SessionRecord};
+pub use session::{
+    ClientSession, ClientStateStore, MemoryClientState, SessionCheckpoint, SessionRecord,
+};
 mod transport;
 pub use transport::{HarnessClient, ServiceConnector, connect_or_spawn};
 mod views;
 pub use views::{ClientViews, TaskView, ToolCallView, TranscriptView};
-pub mod jsonl;
 #[cfg(not(target_arch = "wasm32"))]
 mod journal;
+pub mod jsonl;
 #[cfg(not(target_arch = "wasm32"))]
 pub use journal::FileClientState;
 mod headless;

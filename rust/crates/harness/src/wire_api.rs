@@ -50,6 +50,12 @@ pub trait HarnessWireApi: acyclic_stream::ProviderPlatform + 'static {
         request: wire::ObserveRequest,
     ) -> BoxFuture<'a, Result<wire::OperationStatus>>;
 
+    /// Atomically snapshots then follows authenticated scheduler status changes.
+    fn watch_operation<'a>(
+        &'a self,
+        request: wire::ObserveRequest,
+    ) -> BoxFuture<'a, Result<BoxStream<'static, Result<wire::OperationStatus>>>>;
+
     /// Requests authenticated idempotent cancellation.
     fn cancel<'a>(
         &'a self,
@@ -135,10 +141,7 @@ pub fn validate_cancel_request(request: &wire::CancelRequest) -> Result<CancelCo
 
 /// Converts the authoritative scheduler projection to its canonical wire status.
 #[must_use]
-pub fn operation_status(
-    state: &OperationState,
-    replay_through: wire::ReplayCursor,
-) -> wire::OperationStatus {
+pub fn operation_status(state: &OperationState) -> wire::OperationStatus {
     let owner = state.spec.owner.authority();
     let (completion, error) = match state.outcome.as_ref() {
         Some(Outcome::Succeeded(_)) => (wire::CompletionState::Succeeded, None),
@@ -180,7 +183,7 @@ pub fn operation_status(
         owner: Some(encode_authority(owner)),
         cancellation_requested: state.cancellation_requested,
         revision: state.revision,
-        replay_through: Some(replay_through),
+        replay_through: None,
     }
 }
 

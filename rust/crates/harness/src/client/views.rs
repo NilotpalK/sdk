@@ -1,0 +1,166 @@
+//! Renderer-independent committed state and streaming tails.
+
+use crate::{
+    Result,
+    conversation::ConversationMessage,
+    core::{Authority, EventPayload, LifecycleState},
+    model::ModelEvent,
+    wire,
+    wire_codec::{decode_event_payload, encode_authority},
+};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+/// One conversation's committed transcript and current model tail.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct TranscriptView {
+    /// Immutable content references in conversation order.
+    pub messages: Vec<ConversationMessage>,
+    /// Text received since the last committed assistant message.
+    pub streaming_text: String,
+    /// Provider-exposed reasoning for the current step.
+    pub reasoning: String,
+}
+
+/// A tool invocation, including incremental stdout/stderr supplied by the host.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ToolCallView {
+    /// Registered tool name.
+    pub name: String,
+    /// Model arguments.
+    pub arguments: serde_json::Value,
+    /// Streaming output chunks in arrival order.
+    pub output: String,
+    /// Canonical call message, when committed.
+    pub call: Option<ConversationMessage>,
+    /// Canonical result message, when committed.
+    pub result: Option<ConversationMessage>,
+}
+
+/// Task/subagent lifecycle, independent of terminal or web presentation.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TaskView {
+    /// Latest committed lifecycle.
+    pub status: LifecycleState,
+    /// Optional diagnostic from the lifecycle transition.
+    pub reason: Option<String>,
+    /// Parent task, if this task was forked.
+    pub parent: Option<Authority>,
+}
+
+/// Shared view model for ratatui, browser and WASM consumers.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ClientViews {
+    /// Authority-keyed transcripts; keys are `kind:id`.
+    pub transcripts: BTreeMap<String, TranscriptView>,
+    /// Authority-keyed tool calls, then provider call identity.
+    pub tools: BTreeMap<String, BTreeMap<String, ToolCallView>>,
+    /// Root and child aggregate lifecycles.
+    pub tasks: BTreeMap<String, TaskView>,
+    /// Provider usage metadata, keyed by conversation. Providers retain their exact units.
+    pub usage: BTreeMap<String, serde_json::Value>,
+}
+
+pub(super) fn authority_key(authority: &wire::Authority) -> String {
+    format!("{}:{}", authority.kind, authority.id)
+}
+
+impl ClientViews {
+    pub(super) fn apply(&mut self, authority: &wire::Authority, payload: EventPayload) {
+        let key = authority_key(authority);
+        match payload {
+            EventPayload::LifecycleTransitioned { to, reason, .. } => {
+                let view = self.tasks.entry(key).or_insert(TaskView {
+                    status: to,
+                    reason: None,
+                    parent: None,
+                });
+                view.status = to;
+                view.reason = reason;
+            }
+            EventPayload::ConversationMessageAppended { message } => {
+                let transcript = self.transcripts.entry(key.clone()).or_default();
+                if message.kind == crate::conversation::MessageKind::Assistant {
+                    transcript.streaming_text.clear();
+                    transcript.reasoning.clear();
+                }
+                if let Some(call_id) = &message.tool_call_id {
+                    let tool = self
+                        .tools
+                        .entry(key)
+                        .or_default()
+                        .entry(call_id.clone())
+                        .or_default();
+                    if message.kind == crate::conversation::MessageKind::ToolCall {
+                        tool.call = Some(*message.clone());
+                    } else {
+                        tool.result = Some(*message.clone());
+                    }
+                }
+                transcript.messages.push(*message);
+            }
+            EventPayload::ForkPublished { seed } => {
+                self.tasks
+                    .entry(authority_key(&encode_authority(&seed.child)))
+                    .or_insert(TaskView {
+                        status: LifecycleState::Pending,
+                        reason: None,
+                        parent: Some(seed.parent),
+                    });
+            }
+            _ => {}
+        }
+    }
+
+    /// Adds a model stream event to the same state that committed replay updates.
+    pub fn model_event(&mut self, authority: &wire::Authority, event: ModelEvent) {
+        let key = authority_key(authority);
+        match event {
+            ModelEvent::Content { delta } => self
+                .transcripts
+                .entry(key)
+                .or_default()
+                .streaming_text
+                .push_str(&delta),
+            ModelEvent::Reasoning { delta } => self
+                .transcripts
+                .entry(key)
+                .or_default()
+                .reasoning
+                .push_str(&delta),
+            ModelEvent::ToolCall {
+                call_id,
+                name,
+                arguments,
+            } => {
+                let tool = self
+                    .tools
+                    .entry(key)
+                    .or_default()
+                    .entry(call_id)
+                    .or_default();
+                tool.name = name;
+                tool.arguments = arguments;
+            }
+            ModelEvent::Completed { metadata } => {
+                self.usage.insert(key, metadata);
+            }
+        }
+    }
+
+    /// Appends output without requiring a renderer to maintain a second tool registry.
+    pub fn tool_output(&mut self, authority: &wire::Authority, call_id: &str, delta: &str) {
+        self.tools
+            .entry(authority_key(authority))
+            .or_default()
+            .entry(call_id.to_owned())
+            .or_default()
+            .output
+            .push_str(delta);
+    }
+}
+
+pub(super) fn payload(event: &wire::EventEnvelope) -> Result<EventPayload> {
+    decode_event_payload(&event.event_type, &event.canonical_payload_json, &mut None)
+        .map(|(payload, _)| payload)
+}

@@ -17,6 +17,10 @@ build = "build.rs"
 name = "main"
 path = "tests/main.rs"
 
+[[test]]
+name = "client_session"
+path = "tests/client_session.rs"
+
 [lib]
 crate-type = ["rlib", "cdylib"]
 
@@ -80,6 +84,7 @@ jsonschema.workspace = true
 rmcp = { workspace = true, features = ["client", "transport-async-rw"] }
 js-sys = { workspace = true, optional = true }
 prost.workspace = true
+prost-reflect = { workspace = true, features = ["serde"] }
 schemars = "=1.2.2"
 serde = { workspace = true, features = ["rc"] }
 serde_json = { workspace = true, features = ["unbounded_depth", "raw_value"] }

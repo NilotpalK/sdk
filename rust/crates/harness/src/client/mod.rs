@@ -20,6 +20,13 @@ mod hypothesis;
 pub use hypothesis::{Begin, Hypothesis, Provenance, View};
 mod kernel;
 pub use kernel::Client;
+mod session;
+pub use session::{ClientSession, ClientStateStore, MemoryClientState, SessionRecord};
+mod transport;
+pub use transport::{HarnessClient, ServiceConnector, connect_or_spawn};
+mod views;
+pub use views::{ClientViews, TaskView, ToolCallView, TranscriptView};
+pub mod jsonl;
 #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
 mod wasm;
 

@@ -26,11 +26,7 @@ Replicated providers can use `request::append_digest`, `request::fork_digest`, a
 
 Use `children_page` to discover large agent or stream hierarchies. Its ordered continuation carries the exact last hierarchy-changing commit ID; a concurrent path creation returns `HierarchyChanged`, so restart the traversal instead of silently missing or duplicating a child. Ancestor paths are materialized lazily when descendants are created; no fork lineage is required for discovery.
 
-`LocalStream` writes one first-party v1 journal/snapshot format. The journal magic is `ACYCLIC-STREAM-LOCAL-V1\0`; the snapshot magic is `ACYCLIC-STREAM-SNAP-V01\0`. Both bind eight little-endian limit words and a journal epoch. A snapshot then holds the canonical `ACYCLIC-STREAM-STATE-V1\0` state and a SHA-256 checksum. A journal frame holds a four-byte little-endian payload length, an eight-byte sampled Unix commit timestamp, the canonical command protobuf and a SHA-256 checksum. There are no expiry fields, format readers or migration branches. Other bytes are incompatible.
-
 Recovery rejects unknown or duplicate protobuf fields, duplicate retained identities, invalid history links and capacity violations. It validates the complete semantic prefix before truncating a torn final frame or restarting a journal covered by the immediately succeeding snapshot epoch. A failed semantic open preserves existing journal/snapshot bytes and releases ownership. Successful recovery synchronizes recovered frames before exposing state. An unfinished snapshot temporary file is inert and is overwritten by the next compaction.
-
-The crash model permits a torn final append or header and a crash between durable snapshot installation and journal restart. A valid checksummed frame after an invalid frame indicates corruption and fails closed. Checksums detect damage; they do not authenticate a hostile storage device or prove arbitrary power-loss behavior.
 
 The [Rust API](https://docs.rs/acyclic-stream/latest/acyclic_stream/) and [v1 protocol](https://github.com/acyclic-labs/sdk/tree/main/rust/crates/stream/proto/stream/v1) are the sources for exact limits and commit behavior.
 

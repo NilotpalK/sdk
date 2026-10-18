@@ -124,6 +124,17 @@ impl LocalStream {
         if let Some(error) = replay_error {
             return Err(error);
         }
+        if journal.legacy {
+            // Snapshot first: a crash during migration is handled by the
+            // existing epoch+1 restart protocol, without overwriting V1 in place.
+            let state = provider.encode_state().await;
+            journal = spawn_blocking(move || {
+                journal.compact(&state, None)?;
+                Ok::<_, LocalStreamError>(journal)
+            })
+            .await
+            .map_err(|_| LocalStreamError::Executor)??;
+        }
         journal._ownership_anchor = ownership_anchor;
         commit_clock.unpin();
         let (failed, _) = watch::channel(false);
@@ -132,6 +143,7 @@ impl LocalStream {
                 provider,
                 commit_clock,
                 journal: Arc::new(Mutex::new(journal)),
+                device: Mutex::new(()),
                 visibility: RwLock::new(()),
                 publication: RwLock::new(()),
                 synced: watch::channel(0_u64).0,
@@ -204,32 +216,9 @@ impl LocalStream {
     }
 
     fn flush_all(&self, span: &tracing::Span) -> Result<(), StreamError> {
-        #[cfg(feature = "test-support")]
-        let written;
-        let (target, file, durability) = {
-            let journal = self.inner.journal.lock().map_err(|_| self.inner.poison())?;
-            if journal.synced >= journal.appended {
-                return Ok(());
-            }
-            #[cfg(feature = "test-support")]
-            {
-                written = (journal.epoch, journal.bytes);
-            }
-            span.record("batch_len", journal.appended - journal.synced);
-            (
-                journal.appended,
-                Arc::clone(&journal.sync),
-                journal.limits.durability,
-            )
-        };
-        sync_file_data(&file, durability).map_err(|_| self.inner.poison())?;
-        let mut journal = self.inner.journal.lock().map_err(|_| self.inner.poison())?;
-        self.inner.publish_synced(&mut journal, target);
-        // A restart in between already marked its own header flushed.
-        #[cfg(feature = "test-support")]
-        if journal.epoch == written.0 {
-            journal.flushed = journal.flushed.max(written.1);
-        }
+        let count = self.inner.flush_through(None)?;
+        span.record("batch_len", count.0);
+        self.inner.trace_flush(count);
         Ok(())
     }
 
@@ -299,6 +288,10 @@ impl LocalStream {
         ));
         spawn_blocking(move || {
             span.in_scope(|| {
+                let _device = inner.device.lock().map_err(|_| LocalStreamError::Corrupt)?;
+                if *inner.failed.borrow() {
+                    return Err(LocalStreamError::Corrupt);
+                }
                 let mut journal = inner
                     .journal
                     .lock()
@@ -324,7 +317,11 @@ impl LocalStream {
                         let _ = release.recv();
                     }
                 }
-                journal.compact(&state, work.as_ref())?;
+                if let Err(error) = journal.compact(&state, work.as_ref()) {
+                    // Publish failure before the device gate admits another seal.
+                    inner.poison();
+                    return Err(error);
+                }
                 let appended = journal.appended;
                 inner.publish_synced(&mut journal, appended);
                 Ok::<_, LocalStreamError>(())
@@ -364,32 +361,17 @@ impl LocalStream {
                     None
                 } else {
                     journal.syncing = true;
-                    Some((
-                        journal.appended,
-                        journal.synced,
-                        journal.bytes,
-                        Arc::clone(&journal.sync),
-                        journal.limits.durability,
-                    ))
+                    Some(())
                 }
             };
             match lead {
-                Some((target, synced_before, journal_bytes, file, durability)) => {
+                Some(()) => {
                     let inner = Arc::clone(&self.inner);
                     let work = self.work.clone();
-                    spawn_blocking(move || {
-                        inner.flush_through(target, &file, durability, work.as_deref());
-                    })
-                    .await
-                    .map_err(|_| self.inner.poison())?;
-                    // Group commit: one fsync covers every frame written since the last one.
-                    tracing::debug!(
-                        fsyncs = 1_u64,
-                        batch_len = target.saturating_sub(synced_before),
-                        journal_bytes,
-                        waiters = self.inner.synced.receiver_count(),
-                        "acyclic.stream.fsync"
-                    );
+                    let flushed = spawn_blocking(move || inner.flush_through(work.as_deref()))
+                        .await
+                        .map_err(|_| self.inner.poison())??;
+                    self.inner.trace_flush(flushed);
                 }
                 None => {
                     if synced.changed().await.is_err() {

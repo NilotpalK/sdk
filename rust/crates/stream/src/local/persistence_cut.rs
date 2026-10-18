@@ -83,9 +83,13 @@ impl LocalStream {
     /// report whether that succeeded, then poison.
     async fn cut_crash(&self, cut: &dyn PersistenceCut) -> StreamError {
         let fail = FAIL_CUT_TRUNCATION.with(std::cell::Cell::get);
-        let journal = self.inner.journal.clone();
+        let inner = self.inner.clone();
         let simulated = spawn_blocking(move || {
-            let journal = journal.lock().map_err(|_| CutSimulationError::Lock)?;
+            let _device = inner.device.lock().map_err(|_| CutSimulationError::Lock)?;
+            // No queued flush may publish the discarded prefix after this
+            // simulated crash, including when truncation itself fails.
+            inner.poison();
+            let journal = inner.journal.lock().map_err(|_| CutSimulationError::Lock)?;
             if fail {
                 return Err(CutSimulationError::Truncate(std::io::Error::other(
                     "injected truncation failure",

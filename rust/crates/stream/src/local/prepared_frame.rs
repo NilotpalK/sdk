@@ -39,7 +39,7 @@ impl PreparedFrame {
                 acyclic_native_runtime::NativeOperationReservation::new(
                     Arc::clone(&work.meter),
                     acyclic_native_runtime::NativeOperationKind::Write,
-                    1,
+                    2,
                 )
             })
             .transpose()?;
@@ -49,15 +49,15 @@ impl PreparedFrame {
                 acyclic_native_runtime::NativeByteReservation::new(
                     Arc::clone(&work.meter),
                     acyclic_native_runtime::NativeOperationKind::Write,
-                    capacity,
+                    capacity + GROUP_SEAL_BYTES,
                 )
             })
             .transpose()?;
         if let Some(work) = &work {
             work.meter.admit_codec(
-                capacity as u64,
-                capacity as u64,
-                (capacity + b"acyclic-stream-local-frame-v1\0".len()) as u64,
+                (capacity + GROUP_SEAL_BYTES) as u64,
+                (capacity + GROUP_SEAL_BYTES) as u64,
+                (capacity + GROUP_SEAL_BYTES + 2 * b"acyclic-stream-local-frame-v1\0".len()) as u64,
             )?;
         }
         Ok(Self {
@@ -136,7 +136,7 @@ impl PreparedFrame {
             self.transfer
                 .as_mut()
                 .ok_or(LocalStreamError::IncompleteFrame)?
-                .record(actual),
+                .record_partial(actual),
         );
         match result {
             Ok(length) if length == self.encoded.len() => Ok(()),

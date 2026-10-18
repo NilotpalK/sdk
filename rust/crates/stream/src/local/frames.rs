@@ -47,7 +47,9 @@ fn encode_header(limits: LocalStreamLimits, epoch: u64) -> Result<Vec<u8>, Local
 
 /// The epoch of a whole journal header written for `limits`.
 fn decode_header(header: &[u8], limits: LocalStreamLimits) -> Option<u64> {
-    let rest = header.strip_prefix(HEADER_MAGIC)?;
+    let rest = header
+        .strip_prefix(HEADER_MAGIC)
+        .or_else(|| header.strip_prefix(LEGACY_HEADER_MAGIC))?;
     let (found, epoch) = rest.split_at_checked(LIMITS_BYTES)?;
     (found == encode_limits(limits).ok()?).then_some(())?;
     Some(u64::from_le_bytes(epoch.try_into().ok()?))

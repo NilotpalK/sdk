@@ -1,5 +1,41 @@
 use super::*;
 
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_poisoned_device_reports_the_correct_crash_simulation_lock()
+-> Result<(), Box<dyn std::error::Error>> {
+    #[derive(Default)]
+    struct Cut(Mutex<Option<CutSimulationError>>);
+    impl PersistenceCut for Cut {
+        fn admit(&self) -> bool {
+            true
+        }
+        fn acknowledge(&self) -> bool {
+            true
+        }
+        fn crashed(&self, simulation: Result<(), CutSimulationError>) {
+            *self.0.lock().unwrap() = simulation.err();
+        }
+    }
+    let directory = tempfile::tempdir()?;
+    let stream = LocalStream::open(directory.path(), LocalStreamLimits::default()).await?;
+    let before = std::fs::read(directory.path().join(JOURNAL_FILE))?;
+    let inner = stream.inner.clone();
+    let failed = std::thread::spawn(move || {
+        let _device = inner.device.lock().unwrap();
+        panic!("poison the device gate");
+    });
+    assert!(failed.join().is_err());
+    let cut = Cut::default();
+    assert_eq!(stream.cut_crash(&cut).await, StreamError::Unavailable);
+    assert!(matches!(
+        cut.0.lock().unwrap().take(),
+        Some(CutSimulationError::DeviceLock)
+    ));
+    assert_eq!(std::fs::read(directory.path().join(JOURNAL_FILE))?, before);
+    Ok(())
+}
+
 // A real deferred group: the device can retain B while losing A before its
 // shared flush completes. Recovery must retain the previously acknowledged seed.
 #[tokio::test]
@@ -29,6 +65,48 @@ async fn reordered_unacknowledged_group_is_recoverable() -> Result<(), Box<dyn s
         reopened.tail(StreamPath::new("b")?).await,
         Err(StreamError::NotFound)
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_empty_group_admits_a_command_with_room_for_exactly_one_seal()
+-> Result<(), Box<dyn std::error::Error>> {
+    for sealed_prefix in [false, true] {
+        let directory = tempfile::tempdir()?;
+        let prefix = Command::Append(keyed_append("first", 0)?);
+        let command = Command::Append(keyed_append("other", 0)?);
+        let prefix_bytes = PreparedFrame::encode(&prefix, 0, None)?.encoded.len();
+        let command_bytes = PreparedFrame::encode(&command, 0, None)?.encoded.len();
+        let limits = LocalStreamLimits {
+            journal_bytes: (HEADER_BYTES
+                + command_bytes
+                + GROUP_SEAL_BYTES
+                + if sealed_prefix {
+                    prefix_bytes + GROUP_SEAL_BYTES
+                } else {
+                    0
+                }) as u64,
+            ..LocalStreamLimits::default()
+        };
+        let stream = LocalStream::open(directory.path(), limits).await?;
+        if sealed_prefix {
+            let frame = stream.prepare(&prefix)?;
+            replay(&stream.inner.provider, prefix).await?;
+            stream.persist(frame).await?;
+            stream.flush()?;
+        }
+        let frame = stream.prepare(&command)?;
+        replay(&stream.inner.provider, command).await?;
+        stream.persist(frame).await?;
+        stream.flush()?;
+        assert_eq!(
+            stream.inner.journal.lock().unwrap().bytes,
+            limits.journal_bytes
+        );
+        drop(stream);
+        let reopened = LocalStream::open(directory.path(), limits).await?;
+        assert_eq!(reopened.tail(StreamPath::new("other")?).await?, 1);
+    }
     Ok(())
 }
 

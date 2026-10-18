@@ -280,13 +280,14 @@ impl Journal {
     }
 
     fn admit(&self, frame: &PreparedFrame) -> Result<(), LocalStreamError> {
+        // An existing unsealed group can close between admission and append.
+        // Without one, only the new command's own seal can consume space.
+        let seals = 1 + u64::from(self.bytes != self.group_start);
         if self.operations >= self.limits.journal_operations
             || self
                 .bytes
                 .checked_add(frame.encoded.len() as u64)
-                // One existing group can seal between admission and append;
-                // the new command must still have room for its own seal.
-                .and_then(|value| value.checked_add(2 * GROUP_SEAL_BYTES as u64))
+                .and_then(|value| value.checked_add(seals * GROUP_SEAL_BYTES as u64))
                 .is_none_or(|value| value > self.limits.journal_bytes)
         {
             return Err(LocalStreamError::InvalidLimits);

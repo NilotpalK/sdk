@@ -1,7 +1,7 @@
 # Local Stream group recovery: correctness and paired performance
 
 Baseline: upstream main `66ddfd542be590eca8f5159b1c29cf17ccee7c0c`.
-Candidate: `fix-local-stream-group-recovery`, V2 group seals.
+Measured candidate: `3b780f2a258af06eea3ba0441e10d035ffbf5f81`, V2 group seals.
 
 The baseline regression `reordered_unacknowledged_group_is_recoverable` failed
 with `Corrupt` before production changes. It now preserves the acknowledged
@@ -60,7 +60,7 @@ To reproduce, copy the benchmark example unchanged into a checkout at the
 baseline SHA, build both checkouts with:
 
 ```sh
-cargo build -p acyclic-stream --features local --release --example local-group-bench
+rustup run 1.98.1-x86_64-pc-windows-gnu cargo build -p acyclic-stream --features local --release --example local-group-bench --target x86_64-pc-windows-gnu
 ```
 
 Keep the resulting executables separately, then run:
@@ -123,3 +123,25 @@ damage, so recovery may discard its damaged suffix. A later group's seal proves
 earlier corruption and preserves fail-closed behavior. This is not hostile-storage
 authentication. See the packaged `LocalStream` rustdoc and
 [design](../superpowers/specs/2026-10-18-local-stream-group-recovery.md).
+
+## Review follow-up
+
+Review added positive argument checks to both benchmark tools and made the
+Windows GNU target/toolchain explicit in the reproduction command. The timing
+samples above remain measurements of the original candidate commit. A positive
+runner smoke test still produces all eight baseline/candidate workload rows;
+zero/negative pairs or iterations are rejected before output/device IO, and
+zero Rust iterations or rounds return an input error rather than panicking.
+
+Admission now reserves a second seal only when an older unsealed group can close
+before the accepted append. Exact-fit empty and fully sealed groups are covered
+by a regression that failed before this change; the racing-seal regression still
+passes. The Loom invariant remains active in release models, and worker panic
+payloads are preserved. A poisoned device gate has its own `test-support` crash
+simulation error variant; downstream exhaustive matches on `CutSimulationError`
+may need to handle `DeviceLock`.
+
+Follow-up validation: 298 unit tests and all four Loom tests in both debug and
+release passed. The README is unchanged because its CI guard requires human
+maintainer approval even for paragraph deletions; the packaged Rust API format
+documentation remains the V2 reference.

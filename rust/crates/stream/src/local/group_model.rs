@@ -26,7 +26,10 @@ fn race<const ORDERED: bool>() {
             }));
         }
         for actor in actors {
-            actor.join().map_err(|_| "group actor panicked")??;
+            match actor.join() {
+                Ok(result) => result?,
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
         }
         let journal = stream.inner.journal.lock().unwrap();
         assert_eq!(journal.appended, 2);

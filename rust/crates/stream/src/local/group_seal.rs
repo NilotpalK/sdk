@@ -102,6 +102,13 @@ impl Journal {
         if self.bytes == self.group_start {
             return Ok(());
         }
+        // The model's negative control must detect bad ordering in release too.
+        #[cfg(acyclic_loom)]
+        assert!(
+            self.sealed_sequence <= self.synced,
+            "seal preceded predecessor flush"
+        );
+        #[cfg(not(acyclic_loom))]
         debug_assert!(
             self.sealed_sequence <= self.synced,
             "seal preceded predecessor flush"

@@ -43,8 +43,9 @@ Native preparation reserves two writes and enough bytes/codec work for the raw
 frame plus one seal before semantic acceptance. The remaining seal ticket moves
 to the journal; superseded tickets refund their unused credit. The seal uses a
 stack buffer and performs no fresh admission/allocation. Capacity admission
-leaves room for two seals: one racing flush may close existing commands between
-admission and append, and the accepted command still needs its own seal.
+leaves room for two seals when commands remain unsealed: one racing flush may
+close them between admission and append, and the accepted command still needs
+its own seal. An empty group needs room for only the new command's seal.
 
 ## Compatibility
 

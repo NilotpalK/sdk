@@ -2,8 +2,8 @@ param(
     [Parameter(Mandatory = $true)][string]$Baseline,
     [Parameter(Mandatory = $true)][string]$Candidate,
     [Parameter(Mandatory = $true)][string]$Output,
-    [int]$Pairs = 5,
-    [int]$Iterations = 256
+    [ValidateRange(1, 2147483647)][int]$Pairs = 5,
+    [ValidateRange(1, 2147483647)][int]$Iterations = 256
 )
 $ErrorActionPreference = 'Stop'
 foreach ($executable in @($Baseline, $Candidate)) {

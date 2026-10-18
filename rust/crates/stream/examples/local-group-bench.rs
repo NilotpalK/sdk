@@ -27,14 +27,6 @@ impl<S: tracing::Subscriber> Layer<S> for Flushes {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let flushes = Flushes::default();
-    tracing::subscriber::set_global_default(
-        tracing_subscriber::Registry::default().with(flushes.clone()),
-    )?;
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .enable_all()
-        .build()?;
     let iterations: usize = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "256".into())
@@ -43,6 +35,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(2)
         .unwrap_or_else(|| "5".into())
         .parse()?;
+    if iterations == 0 || rounds == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "iterations and rounds must be positive",
+        )
+        .into());
+    }
+    let flushes = Flushes::default();
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::Registry::default().with(flushes.clone()),
+    )?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()?;
     println!("round,writers,bytes,operations,fsyncs,ops_per_second,p50_us,p95_us,journal_bytes");
     runtime.block_on(async {
         for round in 0..rounds {

@@ -50,7 +50,7 @@ async fn configured_server_failures_are_visible_and_required_failures_precede_ow
             crate::native_settings::SettingsConfig::new(root.path(), root.path())
                 .codex_home(root.path().join("codex")),
         );
-        let owner = super::super::owner::state_directory(&config.project)?.join("owner.json");
+        let owner = config.resolved_state_directory()?.join("owner.json");
         let opened = LocalHarness::open(config).await;
         if required {
             assert!(
@@ -249,6 +249,10 @@ async fn configured_http_server_initializes_pages_installs_and_calls_selected_to
             .settings(
                 SettingsConfig::new(root.path(), root.path()).codex_home(root.path().join("codex")),
             )
+            // This exercises MCP bounds, not summaries: the stock catalog's canonical
+            // definitions plus the deliberately oversized exchange exceed the scripted 32k
+            // byte-counted threshold with no older source to compact.
+            .compaction(crate::context::CompactionPolicy::Disabled)
             .mcp_limits(crate::mcp::McpClientLimits {
                 catalog_bytes: CATALOG_BYTES,
                 tool_bytes: 8192,

@@ -41,6 +41,11 @@ name = "path_properties"
 path = "tests/path_properties.rs"
 
 [[test]]
+name = "workspace_names"
+path = "tests/workspace_names.rs"
+required-features = ["fuzzing"]
+
+[[test]]
 name = "cloud_contract"
 path = "tests/cloud_contract.rs"
 required-features = ["memory"]
@@ -128,6 +133,7 @@ diffy.workspace = true
 futures.workspace = true
 hex.workspace = true
 notify = { workspace = true, optional = true }
+dirs = { workspace = true, optional = true }
 parking_lot.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -218,13 +224,14 @@ windows = { version = "0.62.2", features = [
 
 
 [features]
+session = ["distributed", "acyclic-stream/grpc"]
 fuzzing = []
 model-checking = ["dep:loom"]
 default = ["local", "memory", "native-watch", "native-mount"]
 local = ["distributed", "acyclic-objects/local", "acyclic-stream/local", "dep:fs2", "dep:tempfile"]
 memory = ["distributed"]
 native-watch = ["dep:notify"]
-native-mount = ["native-watch", "dep:fs2", "dep:fuser", "dep:nix"]
+native-mount = ["dep:dirs", "native-watch", "dep:fs2", "dep:fuser", "dep:nix"]
 s3-http = ["distributed", "dep:base64", "dep:crc-fast", "dep:s3s", "dep:serde_urlencoded", "dep:subtle", "dep:sync_wrapper", "dep:time", "dep:urlencoding"]
 distributed = ["dep:acyclic-objects"]
 browser = ["dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:web-sys"]
@@ -279,3 +286,13 @@ required-features = ["memory"]
 name = "object_batches_alloc"
 harness = false
 required-features = ["memory"]
+
+[[test]]
+name = "session_fs"
+path = "tests/session_fs.rs"
+required-features = ["memory", "session"]
+
+[[test]]
+name = "session_fs_model"
+path = "tests/session_fs_model.rs"
+required-features = ["memory", "session"]

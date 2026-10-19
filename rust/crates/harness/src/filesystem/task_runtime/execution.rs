@@ -127,15 +127,7 @@ where
             .await?
             .with_task_files(task_files)
             .with_input_verifier(task_context.clone());
-        let executor = StockExecutor::new(model, provider, context, tools);
-        // Threshold compaction is the default only where summaries have a
-        // private writer; enabling it elsewhere is rejected at turn entry.
-        let executor = if task_context.private_summaries(None).is_ok() {
-            executor
-        } else {
-            executor.with_compaction_policy(crate::context::CompactionPolicy::Disabled)
-        };
-        let executor = executor
+        let executor = StockExecutor::new(model, provider, context, tools)
             .with_limits(limits)
             .with_tool_authority(scope, self.policy.clone())?
             .with_durable_task(self.host.clone(), task, fence.clone())
@@ -190,6 +182,12 @@ where
 
     pub(crate) fn with_summary_source(mut self, source: Option<Box<FileRef>>) -> Self {
         self.executor = self.executor.with_summary_source(source);
+        self
+    }
+
+    #[cfg(all(feature = "hooks", not(target_arch = "wasm32")))]
+    pub(crate) fn with_hooks(mut self, hooks: Option<Arc<crate::hooks::BoundHooks>>) -> Self {
+        self.executor = self.executor.with_hooks(hooks);
         self
     }
 

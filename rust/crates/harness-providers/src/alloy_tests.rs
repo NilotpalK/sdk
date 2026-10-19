@@ -16,6 +16,12 @@ struct Routing {
     sent: Mutex<Vec<HttpRequest>>,
 }
 impl HttpTransport for Routing {
+    fn delay(&self, wait: std::time::Duration) -> acyclic_stream::BoxProviderFuture<'static, ()> {
+        crate::fixtures::delay(wait)
+    }
+    fn now(&self) -> std::time::Duration {
+        crate::fixtures::now()
+    }
     fn send(&self, request: HttpRequest) -> BoxProviderFuture<'_, Result<HttpResponse>> {
         Box::pin(async move {
             let name = request
@@ -31,6 +37,7 @@ impl HttpTransport for Routing {
                 .to_owned();
             self.sent.lock().unwrap().push(request);
             Ok(HttpResponse {
+                retry_after: None,
                 status: 200,
                 body: Box::pin(futures::stream::iter([Ok(Bytes::from(body))])),
             })
@@ -53,6 +60,8 @@ fn registry(capacities: &[u32]) -> (Registry, Arc<Routing>) {
                     base_url: format!("http://localhost/{name}"),
                     headers: BTreeMap::new(),
                     max_event_bytes: 65536,
+                    retry: crate::RetrySpec::DEFAULT,
+                    timeouts: crate::TimeoutSpec::DEFAULT,
                     token_counter: Some(TokenCounterSpec {
                         path: "count".into(),
                         adapter: *adapter,
@@ -62,9 +71,10 @@ fn registry(capacities: &[u32]) -> (Registry, Arc<Routing>) {
                     models: BTreeMap::from([(
                         "fixture".into(),
                         ModelSpec {
+                            max_context_tokens: None,
                             capacity: ModelContextCapacity {
                                 context_tokens,
-                                output_tokens: context_tokens / 4,
+                                output_tokens: Some(context_tokens / 4),
                             },
                             features: ModelFeatures {
                                 tools: true,
@@ -132,7 +142,7 @@ fn all_policies_resolve_to_real_models_and_reject_unsupported_members() -> Resul
             alloy.capacity(),
             ModelContextCapacity {
                 context_tokens: 4096,
-                output_tokens: 1024
+                output_tokens: Some(1024)
             }
         );
         #[cfg(not(target_arch = "wasm32"))]
@@ -236,7 +246,7 @@ proptest! {
             prop_assert_eq!(&a.model().provider,MEMBERS[(ordinal%4) as usize].0);
             let capacity=a.context_capacity(a.model()).unwrap();
             prop_assert_eq!(capacity.context_tokens,expected);
-            prop_assert_eq!(capacity.output_tokens,expected/4);
+            prop_assert_eq!(capacity.output_tokens,Some(expected/4));
         }
     }
     #[test]

@@ -2,6 +2,7 @@
 pub(crate) mod children;
 pub use children::{ArchiveInput, SendInput, SpawnInput, WaitInput, WaitMode};
 mod agent_files;
+mod agent_selection;
 mod bash;
 pub use bash::BashInput;
 mod defaults;
@@ -17,8 +18,7 @@ pub use command::parse_command;
     feature = "native-execution",
     not(target_arch = "wasm32")
 ))]
-pub(crate) use fs_command::FsCommand;
-pub(crate) use fs_command::parse_fs_command;
+pub(crate) use fs_command::{FsCommand, parse_fs_command};
 #[cfg(all(
     feature = "filesystem-local",
     feature = "native-execution",
@@ -27,6 +27,14 @@ pub(crate) use fs_command::parse_fs_command;
 pub mod git;
 
 pub(crate) use defaults::bind_defaults;
+
+/// The one conversion of a rejected fs/bash operand into a model-visible
+/// result. Input the model must correct never becomes an executor error.
+pub(crate) fn rejected_input(error: crate::Error) -> crate::tool::ToolResult {
+    crate::tool::ToolResult {
+        value: serde_json::json!({"error": error.to_string()}),
+    }
+}
 
 #[cfg(all(test, acyclic_harness_loom))]
 pub(crate) use children::cancellable as cancellable_child_wait;

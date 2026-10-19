@@ -3,7 +3,7 @@ use serde_json::{Value, json};
 use std::path::Path;
 
 async fn baseline(path: &str) -> TestResult<Value> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/scenarios");
+    let root = Path::new(acyclic_harness::build_metadata::MANIFEST_DIR).join("tests/scenarios");
     let case = scenario::load_value(&root, &root.join(path))?;
     drivers::run(case.clone()).await?;
     Ok(case)
@@ -29,8 +29,10 @@ async fn instruction_oracles_reject_wrong_order_roots_bytes_and_missing_discover
                     .ok_or("missing case object")?
                     .remove("discovery");
             }
+            // Instructions are scoped user-role frames (#849): forbidding that
+            // frame must reject the discovered request.
             "forbidden" => {
-                case["expect"]["not_requests"] = json!([{"messages":[{"role":"system"}]}])
+                case["expect"]["not_requests"] = json!([{"messages":[{"role":"user","content":{"policy":{"project_instructions":{}}}}]}])
             }
             _ => return Err("unknown mutation".into()),
         }

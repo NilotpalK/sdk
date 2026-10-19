@@ -86,12 +86,14 @@ mod content_read;
 #[cfg(feature = "filesystem")]
 pub use content_read::*;
 mod content_write;
-pub(crate) use content_write::PrivateSummaries;
+pub(crate) use content_write::{PrivateSummaries, SummaryDestination};
 mod groups;
 mod interactions;
 mod model_context;
 mod tool_dispatch;
 pub use groups::*;
+#[cfg(all(feature = "filesystem", not(target_arch = "wasm32")))]
+pub(crate) use tool_dispatch::PolicyVerdict;
 
 #[cfg(test)]
 mod tests;

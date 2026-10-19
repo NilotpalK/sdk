@@ -54,6 +54,12 @@ mod summary_file;
 #[cfg(any(test, feature = "filesystem"))]
 pub(crate) mod summary_identity;
 mod tool_execution;
+mod tool_failure;
+pub(crate) use tool_execution::tool_failure_content;
+pub(crate) use tool_failure::{CauseText, ToolFailureText};
+pub use tool_failure::{TOOL_FAILURE_MESSAGE_BYTES, ToolErrorClass, ToolFailureCause};
+#[cfg(all(feature = "hooks", feature = "filesystem", not(target_arch = "wasm32")))]
+mod tool_hooks;
 mod tool_resolution;
 pub(crate) use content::verify_model_contents_scoped;
 #[cfg(all(test, feature = "filesystem"))]
@@ -280,18 +286,21 @@ pub enum ExecutionEvent {
         #[cfg_attr(feature = "wasm", tsify(type = "WasmFileRefWire"))]
         projection: FileRef,
     },
-    /// A terminal tool failure recorded without exception bodies or secrets.
+    /// A settled tool failure, returned to the model as the call's result; recorded without
+    /// exception bodies or secrets.
     ToolFailed {
         /// Zero-based executor step.
         step: u32,
         /// Stable call identity.
         call_id: String,
-        /// Bounded classification; raw provider errors never enter the journal.
+        /// Stage that failed.
         reason: ToolFailureKind,
+        /// Bounded, sanitized cause the model receives; the raw error stays in the log.
+        cause: ToolFailureCause,
     },
 }
 
-/// Stable, non-secret terminal tool failure classes.
+/// Stable, non-secret classes of a settled tool failure the model receives as its result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
@@ -304,6 +313,12 @@ pub enum ToolFailureKind {
     ProjectionRejected,
     /// A result artifact could not be published under the pinned limits.
     PublicationRejected,
+    /// The composition binds no granted tool by the called name; recorded without a start.
+    Unavailable,
+    /// The arguments violated the tool's pinned input schema; recorded without a start.
+    InvalidInput,
+    /// The bound policy denied the call.
+    Refused,
 }
 
 impl ToolFailureKind {
@@ -315,7 +330,16 @@ impl ToolFailureKind {
             Self::InvalidOutput => "tool output violated its pinned schema",
             Self::ProjectionRejected => "tool result projection was rejected",
             Self::PublicationRejected => "tool result artifact could not be published",
+            Self::Unavailable => "tool is not available",
+            Self::InvalidInput => "tool arguments violated the input schema",
+            Self::Refused => "tool policy refused the call",
         }
+    }
+
+    /// Whether the call is settled before any dispatch, so no start precedes the failure.
+    #[must_use]
+    pub const fn precedes_dispatch(self) -> bool {
+        matches!(self, Self::Unavailable | Self::InvalidInput | Self::Refused)
     }
 }
 
@@ -440,6 +464,8 @@ pub struct StockExecutor {
     provider: Arc<dyn ModelProvider>,
     context: ContextPipeline,
     tools: ToolRegistry,
+    #[cfg(all(feature = "hooks", feature = "filesystem", not(target_arch = "wasm32")))]
+    hooks: Option<Arc<crate::hooks::BoundHooks>>,
     limits: Limits,
     tool_scope: RuntimeScope,
     policy: Option<Arc<dyn ToolPolicy>>,
@@ -454,7 +480,10 @@ pub struct StockExecutor {
         Arc<dyn crate::conversation::ContentResidencyVerifier>,
     )>,
     task_context: Option<(Arc<crate::runtime::TaskContext>, OperationId)>,
-    compaction: crate::context::CompactionPolicy,
+    // `None` is the default: threshold compaction wherever the bound task can
+    // publish private summaries, and none elsewhere. An explicit policy is
+    // verified at turn entry.
+    compaction: Option<crate::context::CompactionPolicy>,
     reconciliation_only: bool,
 }
 
@@ -518,7 +547,9 @@ pub(crate) struct ModelEventAdmission {
 mod tests;
 
 mod validation;
-pub(crate) use validation::{compile_json_schema, preparation_format, validate_json_schema_value};
+pub(crate) use validation::{
+    check_json_schema_value, compile_json_schema, preparation_format, validate_json_schema_value,
+};
 
 /// Bounded JSON shared by the existing IO adapters.
 pub mod json;

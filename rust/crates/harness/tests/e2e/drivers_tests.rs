@@ -3,9 +3,32 @@ use crate::TestResult;
 use serde_json::json;
 use std::path::Path;
 
+#[tokio::test(start_paused = true)]
+async fn direct_swarm_dispatch_rejects_a_permanently_pending_reopen() -> TestResult {
+    let root = Path::new(acyclic_harness::build_metadata::MANIFEST_DIR).join("tests/scenarios");
+    let mut value =
+        crate::scenario::load_value(&root, &root.join("swarm/prefetch-promotion.json"))?;
+    run(value.clone()).await?;
+    value.as_object_mut().ok_or("scenario")?.remove("driver");
+    let case = serde_json::from_value(value)?;
+    let error = run(super::Case::SwarmFault(
+        Box::new(case),
+        crate::swarm_wire::Fault::StalledReopen,
+    ))
+    .await
+    .expect_err("an async driver owner hid a permanent reopen stall");
+    assert!(
+        error
+            .to_string()
+            .contains("stalled: driver at swarm index reopen"),
+        "{error}"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn plan_query_oracles_check_every_file_and_rendered_revision() -> TestResult {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/scenarios");
+    let root = Path::new(acyclic_harness::build_metadata::MANIFEST_DIR).join("tests/scenarios");
     for name in [
         "lifecycle",
         "multiple-raw-and-code",
@@ -27,7 +50,7 @@ async fn plan_query_oracles_check_every_file_and_rendered_revision() -> TestResu
 
 #[tokio::test]
 async fn plans_oracles_reject_wrong_bytes_states_raw_fallback_and_missing_files() -> TestResult {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/scenarios");
+    let root = Path::new(acyclic_harness::build_metadata::MANIFEST_DIR).join("tests/scenarios");
     for name in ["lifecycle", "multiple-files", "malformed-raw"] {
         let mut baseline =
             crate::scenario::load_value(&root, &root.join(format!("plans/{name}.json")))?;
@@ -44,7 +67,7 @@ async fn plans_oracles_reject_wrong_bytes_states_raw_fallback_and_missing_files(
 
 #[tokio::test]
 async fn unbound_tool_oracles_reject_corrupted_names_and_arguments() -> TestResult {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/scenarios");
+    let root = Path::new(acyclic_harness::build_metadata::MANIFEST_DIR).join("tests/scenarios");
     for path in [
         "plain",
         "pinned",
@@ -77,7 +100,7 @@ async fn unbound_tool_oracles_reject_corrupted_names_and_arguments() -> TestResu
 
 #[tokio::test]
 async fn unbound_tool_oracles_reject_inserted_arguments() -> TestResult {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/scenarios");
+    let root = Path::new(acyclic_harness::build_metadata::MANIFEST_DIR).join("tests/scenarios");
     for (path, arguments) in [
         (
             "array-arguments",
@@ -133,7 +156,7 @@ async fn driver_schemas_reject_unknown_and_inapplicable_fields() {
 
 #[tokio::test]
 async fn composer_oracles_reject_changed_results_completions_bytes_and_snapshots() -> TestResult {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/scenarios");
+    let root = Path::new(acyclic_harness::build_metadata::MANIFEST_DIR).join("tests/scenarios");
     let path = root.join("composer/mentions/pinned.json");
     run(crate::scenario::load_value(&root, &path)?).await?;
     let baseline = crate::scenario::load_value(&root, &path)?;
@@ -176,7 +199,7 @@ async fn composer_oracles_reject_changed_results_completions_bytes_and_snapshots
 
 #[tokio::test]
 async fn markdown_oracles_reject_coalescing_reordering_and_reasoning_leaks() -> TestResult {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/scenarios");
+    let root = Path::new(acyclic_harness::build_metadata::MANIFEST_DIR).join("tests/scenarios");
     for (name, mutations) in [
         (
             "fence-split",
@@ -258,7 +281,7 @@ async fn markdown_oracles_reject_coalescing_reordering_and_reasoning_leaks() -> 
 #[tokio::test]
 async fn composer_byte_boundary_oracles_reject_character_counts_and_expansion_overflow()
 -> TestResult {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/scenarios");
+    let root = Path::new(acyclic_harness::build_metadata::MANIFEST_DIR).join("tests/scenarios");
     for (name, maximum) in [
         ("ascii-exact", 4),
         ("ascii-over", 5),
@@ -289,7 +312,7 @@ fn dispatch_retains_only_the_selected_driver_frame() -> TestResult {
     let baseline = serde_json::from_slice::<serde_json::Value>(include_bytes!(
         "../../../harness-fuzz/corpus/client_diff/local-read"
     ))?;
-    let direct = crate::local_execution::run(serde_json::from_value(baseline.clone())?);
+    let direct = super::local_execution::run(serde_json::from_value(baseline.clone())?);
     let dispatched = run(baseline);
     let bytes = std::mem::size_of_val(&dispatched);
     let inline = std::mem::size_of_val(&direct);

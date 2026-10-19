@@ -86,6 +86,7 @@ pub(super) fn count(table: &[u8], entry: usize) -> Result<usize> {
 pub(super) fn build(
     document: &[u8],
     count: usize,
+    items: u64,
     bounds: super::JsonBounds,
     code: Option<crate::wire::ErrorCode>,
     charge: &mut dyn FnMut(super::JsonCodecCharge) -> Result<()>,
@@ -115,12 +116,30 @@ pub(super) fn build(
         bytes: length as u64,
     })?;
     table.resize(length, 0);
-    // Each byte causes at most one lexical item inspection. Fund the complete
-    // scan before entering it; no callbacks or encodings are needed per item.
+    // The scan re-examines exactly the serializer's lexical items. Fund them
+    // before entering it; the scan may not examine one item more or fewer.
+    #[cfg(test)]
+    let charged_items = if super::item_budget_tests::RESTORE_BYTE_CHARGE.get() {
+        document.len() as u64
+    } else {
+        items
+    };
+    #[cfg(not(test))]
+    let charged_items = items;
     charge(JsonCodecCharge::Inspect {
-        items: document.len() as u64,
+        items: charged_items,
     })?;
-    let mut prepaid = |_| Ok(());
+    let mut remaining = items;
+    let mut prepaid = |event| match event {
+        JsonCodecCharge::Work { items, .. } if items <= remaining => {
+            remaining -= items;
+            Ok(())
+        }
+        _ => Err(boundary(
+            "JSON array index scan exceeds its admission",
+            code,
+        )),
+    };
     let prepaid =
         std::cell::RefCell::new(&mut prepaid as &mut dyn FnMut(JsonCodecCharge) -> Result<()>);
     let mut lexical = super::admission::Lexical::default();
@@ -130,6 +149,12 @@ pub(super) fn build(
         let string = lexical.string;
         let item = lexical.byte(*byte, bounds, code, &prepaid)?;
         index.byte(&mut table, *byte, depth, string, item)?;
+    }
+    if lexical.items != items {
+        return Err(boundary(
+            "JSON array index scan differs from its admission",
+            code,
+        ));
     }
     index.finish(&table)?;
     Ok(table)

@@ -12,7 +12,7 @@ async fn fixture() -> (tempfile::TempDir, LocalHarness, FileValue) {
         ScriptedModelProvider::new([ScriptedTurn::Text("delegated answer".into())])
             .with_context_capacity(crate::context::ModelContextCapacity {
                 context_tokens: 32_768,
-                output_tokens: 4096,
+                output_tokens: Some(4096),
             }),
     );
     let model = Model::new(
@@ -76,7 +76,8 @@ fn replay_admission_preserves_results_and_errors_with_zero_workspace_work() {
         .enable_all()
         .build()
         .unwrap();
-    let pair = differential::pair::<_, _, (&'static str, u64)>(
+    let pair = differential::pair_of(
+        &["read", "verify", "retain", "view-items", "view-allocations"],
         || runtime.block_on(fixture()),
         |(_directory, harness, request), old| {
             runtime.block_on(async {
@@ -178,7 +179,8 @@ fn preparation_status_preserves_bytes_and_errors_without_loading_its_report() {
         .enable_all()
         .build()
         .unwrap();
-    let pair = differential::pair::<_, _, (&'static str, u64)>(
+    let pair = differential::pair_of(
+        &["read", "verify", "retain"],
         || runtime.block_on(fixture()),
         |(_directory, harness, _request), old| {
             runtime.block_on(async {

@@ -21,10 +21,13 @@ mod compact;
 mod compaction;
 mod context;
 mod goals;
+mod hermetic;
 #[cfg(feature = "hooks")]
 mod hook_configuration;
 #[cfg(all(feature = "native-execution", unix))]
 mod hook_lifecycle;
+#[cfg(all(feature = "native-execution", unix))]
+mod tool_hooks;
 use std::{
     path::Path,
     sync::{Arc, Mutex},
@@ -60,7 +63,7 @@ fn checkout_config(
 fn capacity() -> ModelContextCapacity {
     ModelContextCapacity {
         context_tokens: 32_768,
-        output_tokens: 4096,
+        output_tokens: Some(4096),
     }
 }
 
@@ -72,11 +75,14 @@ fn model() -> Result<Model> {
 fn automatic_compaction_fits_small_models_without_rewriting_explicit_budgets() -> Result<()> {
     let capacity = ModelContextCapacity {
         context_tokens: 32_768,
-        output_tokens: 4096,
+        output_tokens: Some(4096),
     };
     let explicit = acyclic_harness::context::ThresholdCompaction::default();
     let automatic = acyclic_harness::context::ThresholdCompaction::for_capacity(capacity, 24_000)?;
-    assert_eq!(automatic.validate(capacity, None)?, capacity.output_tokens);
+    assert_eq!(
+        Some(automatic.validate(capacity, None)?),
+        capacity.output_tokens
+    );
     assert!(automatic.recent_tokens < explicit.recent_tokens);
     assert!(
         24_000 + automatic.response_reserve_tokens + 2 * automatic.recent_tokens
@@ -87,7 +93,7 @@ fn automatic_compaction_fits_small_models_without_rewriting_explicit_budgets() -
         acyclic_harness::context::ThresholdCompaction::for_capacity(
             ModelContextCapacity {
                 context_tokens: 2,
-                output_tokens: 1
+                output_tokens: Some(1)
             },
             0
         )
@@ -102,7 +108,7 @@ async fn incompatible_explicit_compaction_fails_before_owner_creation() -> Resul
     let project = volume(directory.path()).await?;
     let provider = text();
     let mut config = volume_config(directory.path(), project, provider.clone())?;
-    let owner_path = super::owner::state_directory(&config.project)?.join("owner.json");
+    let owner_path = config.resolved_state_directory()?.join("owner.json");
     config = config.compaction(acyclic_harness::context::CompactionPolicy::default());
     assert!(matches!(
         LocalHarness::open(config).await,
@@ -121,7 +127,7 @@ async fn oversized_tool_catalog_fails_before_owner_creation_or_model_dispatch() 
     let mut oversized = tool("test.oversized");
     oversized.definition.description = "x".repeat(capacity().context_tokens as usize);
     let config = volume_config(directory.path(), project, provider.clone())?.tool(oversized);
-    let owner = super::owner::state_directory(&config.project)?.join("owner.json");
+    let owner = config.resolved_state_directory()?.join("owner.json");
     assert!(matches!(
         LocalHarness::open(config).await,
         Err(Error::Invalid(_))
@@ -324,15 +330,21 @@ async fn reopen_retains_owner_and_resumes_admitted_stock_turn_once() -> Result<(
         std::fs::create_dir(&checkout).map_err(super::storage)?;
         checkout
     };
+    // Reopen must find the same owner: every open shares one injected state directory outside the checkout.
+    #[cfg(feature = "native-execution")]
+    let state = directory.path().join("state");
     #[cfg(not(feature = "native-execution"))]
     let project = volume(directory.path()).await?;
     let config = || {
         #[cfg(feature = "native-execution")]
         {
-            Ok::<_, Error>(crate::test_support::local_harness_config(
-                selection.join("."),
-                (model()?, provider.clone()),
-            )?)
+            Ok::<_, Error>(
+                crate::test_support::local_harness_config(
+                    selection.join("."),
+                    (model()?, provider.clone()),
+                )?
+                .state_directory(&state),
+            )
         }
         #[cfg(not(feature = "native-execution"))]
         {
@@ -341,7 +353,7 @@ async fn reopen_retains_owner_and_resumes_admitted_stock_turn_once() -> Result<(
     };
     let harness = bounded_future("open", LocalHarness::open(config()?)).await?;
     #[cfg(feature = "native-execution")]
-    assert_checkout(&harness, directory.path()).await?;
+    assert_checkout(&harness, &state, directory.path()).await?;
     let operation = OperationId::new();
     let Admission::Accepted(acyclic_harness::runtime::RuntimeTask::Durable {
         task_id: task, ..
@@ -502,7 +514,7 @@ async fn corrupt_owner_is_rejected_without_reissuing_credentials() -> Result<()>
     let directory = tempfile::tempdir().map_err(|error| Error::Storage(error.to_string()))?;
     let project = volume(directory.path()).await?;
     let config = || Ok::<_, Error>(volume_config(directory.path(), project.clone(), text())?);
-    let path = super::owner::state_directory(&config()?.project)?.join("owner.json");
+    let path = config()?.resolved_state_directory()?.join("owner.json");
     drop(LocalHarness::open(config()?).await?);
     std::fs::write(&path, b"invalid owner").map_err(|error| Error::Storage(error.to_string()))?;
     assert!(matches!(
@@ -585,18 +597,22 @@ async fn root_output_requires_task_grants_and_exclusive_configuration() -> Resul
 }
 
 #[cfg(feature = "native-execution")]
-async fn assert_checkout(harness: &LocalHarness, other: &Path) -> Result<()> {
+async fn assert_checkout(harness: &LocalHarness, state: &Path, other: &Path) -> Result<()> {
     let checkout = harness
         .workspace_path()
         .ok_or_else(|| Error::NotFound("checkout".into()))?;
-    let config = crate::test_support::local_harness_config(checkout, (model()?, text()))?;
-    let state = super::owner::state_directory(&config.project)?;
+    let state = std::fs::canonicalize(state).map_err(super::storage)?;
     assert!(!state.starts_with(checkout));
     assert!(!checkout.join(".acyclic").exists());
     assert!(!checkout.join("owner.json").exists());
-    // Default workspace tools expose their declared scratch volume. It is the
-    // only checkout entry; authority and owner state still live outside it.
-    assert!(checkout.join(".volumes/scratch").is_dir());
+    // Default workspace tools bind their declared scratch volume, but its
+    // native projection waits for bash. The namespace parent is the only
+    // checkout entry; authority and owner state still live outside it.
+    assert!(checkout.join(".volumes").is_dir());
+    assert!(
+        !checkout.join(".volumes/scratch").exists(),
+        "scratch was projected before bash needed it"
+    );
     assert_eq!(
         std::fs::read_dir(checkout)
             .map_err(super::storage)?
@@ -608,13 +624,6 @@ async fn assert_checkout(harness: &LocalHarness, other: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        assert!(
-            state.starts_with(
-                dirs::data_local_dir()
-                    .ok_or_else(|| Error::NotFound("user data".into()))?
-                    .join("acyclic/harness")
-            )
-        );
         assert_eq!(
             std::fs::metadata(state.join("owner.json"))
                 .map_err(super::storage)?

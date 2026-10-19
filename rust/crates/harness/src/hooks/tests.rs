@@ -35,7 +35,7 @@ async fn early_stdin_closure_preserves_a_deny_with_a_large_tool_payload() -> Res
             HookEvent::PreToolUse,
             &root,
             &root,
-            json!({"tool_name":"bash", "tool_input":{"payload":"x".repeat(1_048_576)}}),
+            &json!({"tool_name":"bash", "tool_input":{"payload":"x".repeat(1_048_576)}}),
             &registry()?,
         )
         .await?;
@@ -57,7 +57,9 @@ async fn exec_form_placeholders_launch_guards_without_retokenizing_paths_or_argu
     if let Some(argument) = std::env::args()
         .find_map(|argument| argument.strip_prefix("hook-exec-child:").map(str::to_owned))
     {
-        let root = std::env::var("CLAUDE_PROJECT_DIR").expect("project root environment");
+        let root = crate::native_environment::variable("CLAUDE_PROJECT_DIR")
+            .and_then(|value| value.into_string().ok())
+            .expect("project root environment");
         if argument != format!("{root}/payload with ' $ ` spaces") {
             eprintln!("guard argument was changed");
             std::process::exit(3);
@@ -100,7 +102,7 @@ async fn exec_form_placeholders_launch_guards_without_retokenizing_paths_or_argu
                 HookEvent::PreToolUse,
                 root,
                 &cwd,
-                json!({"tool_name":"bash"}),
+                &json!({"tool_name":"bash"}),
                 &registry()?,
             )
             .await?;
@@ -1059,7 +1061,7 @@ exit 2
     let input = json!({"tool_name":"bash","session_id":"test"});
     assert_eq!(
         hooks
-            .run(HookEvent::Stop, &workspace, &cwd, input.clone(), &registry)
+            .run(HookEvent::Stop, &workspace, &cwd, &input, &registry)
             .await?,
         HookOutput::default()
     );
@@ -1068,13 +1070,7 @@ exit 2
         "untrusted project commands never execute"
     );
     let output = hooks
-        .run(
-            HookEvent::PreToolUse,
-            &workspace,
-            &cwd,
-            input.clone(),
-            &registry,
-        )
+        .run(HookEvent::PreToolUse, &workspace, &cwd, &input, &registry)
         .await?;
     assert!(
         output.blocks(),
@@ -1097,7 +1093,7 @@ exit 2
             HookEvent::PreToolUse,
             &workspace,
             &workspace.join("missing"),
-            input,
+            &input,
             &registry,
         )
         .await?;

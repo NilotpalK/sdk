@@ -204,7 +204,13 @@ impl<P: StreamProvider> CoordinatorTaskHost<P> {
             }
             Outcome::Failed { message } => Outcome::Failed { message },
             Outcome::Cancelled => Outcome::Cancelled,
-            Outcome::Indeterminate { operation_id } => Outcome::Indeterminate { operation_id },
+            Outcome::Indeterminate {
+                operation_id,
+                cause,
+            } => Outcome::Indeterminate {
+                operation_id,
+                cause,
+            },
         };
         self.coordinator
             .lock()
@@ -425,7 +431,7 @@ impl<P: StreamProvider> CoordinatorTaskHost<P> {
             invocation_cancellation: None,
             root_binding: std::sync::OnceLock::new(),
             root_choice: std::sync::OnceLock::new(),
-            root_gate: Mutex::new(()),
+            root_gate: tokio::sync::Mutex::new(()),
             #[cfg(not(target_arch = "wasm32"))]
             native_custody: custody,
         };

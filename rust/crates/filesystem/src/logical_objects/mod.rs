@@ -253,8 +253,12 @@ fn precondition(error: &ObjectStoreError) -> bool {
 }
 mod requests;
 use requests::*;
+mod index;
 mod read;
 mod write;
 
 #[cfg(all(test, feature = "memory"))]
 mod tests;
+
+#[cfg(all(test, feature = "memory"))]
+pub(crate) use tests::restore_eager_index;

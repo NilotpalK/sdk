@@ -139,7 +139,11 @@ enum CommandDispatch {
         command: OperationId,
         guard_execution: bool,
     },
-    Indeterminate,
+    Indeterminate(crate::CommandIndeterminacy),
+    /// The command failed without an uncertain effect; the task settles failed with its cause.
+    Failed {
+        message: String,
+    },
 }
 
 /// Resume hint for one finite coordinator discovery sweep.

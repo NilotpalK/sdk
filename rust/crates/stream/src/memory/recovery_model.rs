@@ -24,6 +24,11 @@ pub(crate) fn set_fault(fault: Fault) {
     FAULT.with(|current| current.set(fault));
 }
 
+/// Omits this actor's append wake for adapter model negative controls.
+pub fn omit_append_wake() {
+    set_fault(Fault::OmitAppendWake);
+}
+
 pub(crate) fn fault_is(fault: Fault) -> bool {
     FAULT.with(|current| current.get() == fault)
 }
@@ -47,6 +52,11 @@ impl UnixMillisClock for loom::sync::atomic::AtomicU64 {
 /// Owns the real async state machine on the heap, outside Loom's coroutine stack.
 pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
     loom::future::block_on(Box::pin(future))
+}
+
+/// Drives adapter models with the same parked-thread waker as snapshot workers.
+pub fn park<F: std::future::Future>(future: F) -> F::Output {
+    crate::snapshot::park(future)
 }
 
 /// Applies the production recovery path to the existing provider object.
@@ -384,6 +394,29 @@ pub fn snapshot_executor_shutdown(
     polled: bool,
 ) {
     crate::memory::parking_model::shutdown(discard, children, checked, cancel, polled);
+}
+
+/// Every consumer departure from real dispatched snapshot jobs, on the memory
+/// provider state lock and the local publication lock, under one mutant.
+pub fn snapshot_consumer_departures(mutant: &str) {
+    use crate::snapshot::model::{Departure, Mutant};
+    let mutant = match mutant {
+        "none" => Mutant::None,
+        "leak-reservation" => Mutant::LeakReservation,
+        "no-wake" => Mutant::NoWake,
+        "armed-after-completion" => Mutant::ArmedAfterCompletion,
+        other => panic!("unknown mutant {other}"),
+    };
+    for departure in [
+        Departure::Keep,
+        Departure::CancelRacesFirstPoll,
+        Departure::CancelRacesRelease,
+    ] {
+        for children in [false, true] {
+            crate::memory::parking_model::abandon(departure, children, mutant);
+            crate::local::parking_model::abandon(departure, children, mutant);
+        }
+    }
 }
 
 /// Accepted readers and watermark queries must not wait for snapshot device I/O.

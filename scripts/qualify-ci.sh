@@ -180,7 +180,7 @@ pinned_pi() {
 # compiles warning-free on wasm32; test-only code is not exempt.
 web_warning_closures() {
   local features
-  for features in browser wasm browser,test-support; do
+  for features in browser wasm browser,test-support wasm,test-support; do
     RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-Dwarnings" \
       cargo check --locked -p acyclic-harness --no-default-features \
         --features "$features" --target wasm32-unknown-unknown --lib --tests
@@ -198,28 +198,28 @@ harness_tests() {
 
 case "$lane" in
   gate)
+    node scripts/check-hermetic-clippy.mjs
     RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-Dwarnings" \
       cargo check --locked -p acyclic-harness-fuzz --bins
     RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-Dwarnings --cfg acyclic_harness_loom --cfg acyclic_loom" \
       cargo check --locked -p acyclic-harness --features model-checking --lib
     RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-Dwarnings --cfg acyclic_harness_loom --cfg acyclic_loom" \
       cargo check --locked -p acyclic-harness --features filesystem-local,model-checking --lib
+    # Unit tests compile without optional native features, so a test seam
+    # cannot cross a feature gate the all-features suites never close.
+    cargo check --locked -p acyclic-harness --features filesystem --lib --tests
     RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-Dwarnings --cfg acyclic_harness_loom --cfg acyclic_loom" \
       harness_tests --features model-checking \
         --test client-mailbox-model --test client_journal_model --test mcp-loom
     RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-Dwarnings --cfg acyclic_harness_loom --cfg acyclic_loom" \
       harness_tests --features model-checking \
         --lib workflow::model_checking::tests::
-    node scripts/qualify-mcp-loom.mjs --all-features
-    node scripts/qualify-mcp-loom.mjs --coordinator-origins --all-features
-    node scripts/qualify-mcp-loom.mjs --summary-checkpoints --all-features
-    node scripts/qualify-mcp-loom.mjs --hook-lifecycle --all-features
-    node scripts/qualify-mcp-loom.mjs --timer
-    node scripts/qualify-mcp-loom.mjs --guest
-    node scripts/qualify-mcp-loom.mjs --fs-binding --all-features
-    RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-Dwarnings" node scripts/qualify-mcp-loom.mjs --memory-accounting
+    node scripts/qualify-mcp-loom.mjs --gate
     nextest --workspace --all-features --locked
     cargo test -p acyclic-harness --all-features --locked --example approved-native-process
+    ;;
+  mount-exclusion)
+    bash scripts/fuzz-mount-exclusion.sh -runs=64 -max_len=4096 -timeout=2
     ;;
   docs)
     # Independent workspaces qualify alongside the root workspace.
@@ -383,10 +383,12 @@ case "$lane" in
     node --test scripts/tiny-ci.test.mjs scripts/cargo-lock-policy.test.mjs scripts/publish-release-assets.test.mjs scripts/release-qualification-artifacts.test.mjs scripts/release-source.test.mjs
     node --test scripts/native-cache-evidence.test.mjs scripts/cache-save-decision.test.mjs scripts/cache-limits.test.mjs scripts/cargo-timings-summary.test.mjs scripts/bench-client-requests.test.mjs
     node --test scripts/test-typescript-qualification.mjs
-    node --test scripts/test-plan-qualification.mjs scripts/test-plan-qualification-gate.mjs scripts/test-plan-qualification-windows-rust.mjs scripts/build-wasm-groups.test.mjs scripts/test-qualify-linux-package-overlap.mjs scripts/qualify-mcp-loom.test.mjs
+    node --test scripts/test-plan-qualification.mjs scripts/test-plan-qualification-gate.mjs scripts/test-plan-qualification-windows-rust.mjs scripts/build-wasm-groups.test.mjs scripts/test-qualify-linux-package-overlap.mjs scripts/qualify-mcp-loom.test.mjs scripts/qualify-ci-preflight-fixtures.test.mjs
     node --test scripts/test-contract-artifacts.mjs scripts/test-contract-targets.mjs
     node scripts/test-verify-release-binary.mjs
-    cargo fmt --all -- --check
+    source scripts/ensure-bun.sh
+    bun test scripts/qualify-rustfmt.test.mjs
+    bash scripts/qualify-rustfmt.sh
     cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
     # Production-only reduced sets must not inherit test/dev features. Keep
     # these with the lane feature-set checks, outside the tiny SDK Static job.
@@ -399,6 +401,21 @@ case "$lane" in
       0e8c2aa59128612c90d9e09c02204e912f29a5b8d9a64671b94608cbe09e064f \
       "$TOOLS_DIR/cargo-deny-0.19.0" cargo-deny-0.19.0-x86_64-unknown-linux-musl/cargo-deny 1
     "$TOOLS_DIR/cargo-deny-0.19.0/cargo-deny" check
+    # Exactly one rustls crypto provider (ring): a second compiled-in provider
+    # makes provider-less rustls builders panic. Cargo.lock resolves every
+    # feature of every member (and the Static job keeps it --locked), so it
+    # sees optional features that cargo-deny's default graph does not.
+    if grep -Eq '^name = "aws-lc-(rs|sys)"$' Cargo.lock; then
+      echo "Cargo.lock contains aws-lc-rs/aws-lc-sys; build rustls with the ring provider only" >&2
+      exit 1
+    fi
+    ;;
+  wasm-tests)
+    # Compile target-specific test code without a browser or native dev-deps.
+    for features in browser,test-support wasm,test-support; do
+      cargo check --locked -p acyclic-harness --no-default-features \
+        --features "$features" --target wasm32-unknown-unknown --lib --tests
+    done
     ;;
   web-warnings)
     # The web lane's compile-only closures, runnable without browsers.
@@ -406,6 +423,7 @@ case "$lane" in
     ;;
   web)
     bash scripts/ensure-rust-target.sh wasm32-unknown-unknown
+    python3 scripts/test-provider-catalog-targets.py
     # The host clippy run cannot see code that only the browser build
     # compiles or omits, so lint each browser build as it ships.
     cargo clippy -p acyclic-fs-wasm --target wasm32-unknown-unknown \

@@ -5,6 +5,9 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 work="$(mktemp -d "${TMPDIR:-/tmp}/acyclic-qualify-ci-test.XXXXXXXX")"
 trap 'rm -rf -- "$work"' EXIT
 mkdir -p "$work/bin"
+# Keep the caller outside the checkout: fixture planning and execution must share
+# their own repository scope, including relative CARGO_TARGET_DIR resolution.
+cd "$work"
 
 # Exercise the actual verifier with a digest-only sha256sum interface,
 # including rejected archive bytes and failed reads.
@@ -82,13 +85,7 @@ set -euo pipefail
 printf '%s\n' "$*" >>"$FAKE_CARGO_LOG"
 printf '%s\n' "${RUSTFLAGS:-}" >>"${FAKE_RUSTFLAGS_LOG:-/dev/null}"
 if [[ " $* " == *' --message-format=json '* ]]; then
-  model=mcp-loom
-  [[ " $* " != *' --test timer_loom '* ]] || model=timer_loom
-  [[ " $* " != *' --test guest_loom '* ]] || model=guest_loom
-  [[ " $* " != *' --test native_binding_model '* ]] || model=native_binding_model
-  [[ " $* " != *' --test memory-accounting-model '* ]] || model=memory-accounting-model
-  [[ " $* " != *' --lib '* ]] || model=acyclic_harness
-  printf '{"reason":"compiler-artifact","target":{"name":"%s"},"profile":{"test":true},"executable":"%s"}\n' "$model" "$FAKE_MCP_LOOM_BINARY"
+  exec "$FAKE_MODEL_FIXTURE_DIR/cargo" "$@"
 elif [[ "$1" == test ]]; then
   case "${FAKE_MODEL_RESULTS:-complete}" in
     missing) ;;
@@ -184,50 +181,45 @@ mkdir -p "$gate/temp" "$gate/artifacts" "$gate/tools/cargo/bin" "$gate/bin"
 cat >"$gate/bin/cargo-nextest" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-printf '%s
-' 'cargo-nextest 0.9.146 (fake)'
+printf '%s\n' 'cargo-nextest 0.9.146 (fake)'
 EOF
 chmod +x "$gate/bin/cargo-nextest"
-cat >"$gate/bin/mcp_loom" <<'EOF'
-#!/usr/bin/env bash
-case "${1:-}" in
-  distributed::*) printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out;\n' ;;
-  local::compact::checkpoints::model::) printf 'test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out;\n' ;;
-  hooks::*|local::checkout_tools::hooks::*) printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out;\n' ;;
-  *) printf 'test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;\n' ;;
-esac
-EOF
-chmod +x "$gate/bin/mcp_loom"
-(
+export FAKE_MODEL_FIXTURE="$root/scripts/qualify-ci-preflight-fixtures.mjs"
+export FAKE_MODEL_FIXTURE_DIR="$gate"
+# Exercise the default target path regardless of the build box's absolute cache.
+unset CARGO_TARGET_DIR
+model_gate() (
   cd "$root"
-  SDK_TEMP_DIR="$gate/temp" SDK_ARTIFACT_DIR="$gate/artifacts" TOOLS_DIR="$gate/tools" \
-    FAKE_CARGO_LOG="$gate/cargo.log" FAKE_RUSTFLAGS_LOG="$gate/flags.log" FAKE_MCP_LOOM_BINARY="$gate/bin/mcp_loom" PATH="$gate/bin:$work/bin:$PATH" \
-    bash scripts/qualify-ci.sh gate
+  : >"$gate/cargo.log"
+  : >"$gate/flags.log"
+  node "$FAKE_MODEL_FIXTURE" prepare "$gate"
+  (
+    SDK_TEMP_DIR="$gate/temp" SDK_ARTIFACT_DIR="$gate/artifacts" TOOLS_DIR="$gate/tools" \
+      FAKE_CARGO_LOG="$gate/cargo.log" FAKE_RUSTFLAGS_LOG="$gate/flags.log" PATH="$gate/bin:$work/bin:$PATH" \
+      bash "$1" gate
+  ) >"$gate/model-gate.stdout" 2>&1 || return 1
+  node "$FAKE_MODEL_FIXTURE" verify "$gate" 2>"$gate/model-gate.stderr"
 )
-mapfile -t cargo_calls <"$gate/cargo.log"
-[[ "${#cargo_calls[@]}" -eq 15 ]]
-[[ "${cargo_calls[0]}" == 'check --locked -p acyclic-harness-fuzz --bins' ]]
-[[ "${cargo_calls[1]}" == 'check --locked -p acyclic-harness --features model-checking --lib' ]]
-[[ "${cargo_calls[2]}" == 'check --locked -p acyclic-harness --features filesystem-local,model-checking --lib' ]]
-[[ "${cargo_calls[3]}" == 'test -p acyclic-harness --locked --features model-checking --test client-mailbox-model --test client_journal_model --test mcp-loom' ]]
-[[ "${cargo_calls[4]}" == 'test -p acyclic-harness --locked --features model-checking --lib workflow::model_checking::tests::' ]]
-[[ "${cargo_calls[5]}" == 'rustc --locked --message-format=json -p acyclic-harness --test mcp-loom --all-features --features model-checking' ]]
-for index in 6 7 8; do
-  [[ "${cargo_calls[index]}" == 'test --locked --message-format=json -p acyclic-harness --lib --no-run --all-features --features model-checking' ]]
-done
-timer_target="$(cd "$root" && node -e 'console.log(require("node:path").resolve(process.env.CARGO_TARGET_DIR || "target", "timer-loom"))')"
-[[ "${cargo_calls[9]}" == "rustc --locked --message-format=json -p acyclic-actors --test timer_loom --features acyclic-stream/local --target-dir $timer_target" ]]
-[[ "${cargo_calls[10]}" == 'rustc --locked --message-format=json -p acyclic-actors --test guest_loom -- --cfg loom' ]]
-[[ "${cargo_calls[11]}" == 'rustc --locked --message-format=json -p acyclic-fs --test native_binding_model --all-features -- --cfg acyclic_fs_loom' ]]
-memory_target="$(cd "$root" && node -e 'console.log(require("node:path").resolve(process.env.CARGO_TARGET_DIR || "target", "memory-accounting-loom"))')"
-[[ "${cargo_calls[12]}" == "rustc --locked --message-format=json -p acyclic-harness --test memory-accounting-model --features filesystem,acyclic-fs/model-checking --target-dir $memory_target -- --cfg acyclic_harness_loom" ]]
-[[ "${cargo_calls[13]}" == 'nextest run --profile ci --workspace --all-features --locked' ]]
-[[ "${cargo_calls[14]}" == 'test -p acyclic-harness --all-features --locked --example approved-native-process' ]]
-mapfile -t flags <"$gate/flags.log"
-for index in 0 1 2 3 4 12; do [[ "${flags[index]}" == *-Dwarnings* ]]; done
-for index in 1 2 3 4; do
-  [[ "${flags[index]}" == *'--cfg acyclic_harness_loom'* ]]
-  [[ "${flags[index]}" == *'--cfg acyclic_loom'* ]]
+if ! model_gate scripts/qualify-ci.sh; then
+  cat "$gate/model-gate.stdout" "$gate/model-gate.stderr" >&2
+  exit 1
+fi
+if ! CARGO_TARGET_DIR=relative-models model_gate scripts/qualify-ci.sh; then
+  cat "$gate/model-gate.stdout" "$gate/model-gate.stderr" >&2
+  exit 1
+fi
+# Controls: a flag or a command added only to the shell gate is rejected.
+for mutation in 's/^    nextest --workspace/    RUSTFLAGS="--cfg added" &/' \
+  's/^    node scripts\/qualify-mcp-loom\.mjs --gate$/    cargo check --locked -p added\n&/'; do
+  sed "$mutation" "$root/scripts/qualify-ci.sh" >"$gate/qualify-mutated.sh"
+  if cmp -s "$root/scripts/qualify-ci.sh" "$gate/qualify-mutated.sh"; then
+    echo "gate control did not apply: $mutation" >&2
+    exit 1
+  fi
+  if model_gate "$gate/qualify-mutated.sh"; then
+    echo "model gate accepted: $mutation" >&2
+    exit 1
+  fi
 done
 
 # Independent controls for missing results and a zero-test suite beside a valid one.
@@ -236,7 +228,7 @@ for mode in missing mixed; do
     cd "$root"
     SDK_TEMP_DIR="$gate/temp" SDK_ARTIFACT_DIR="$gate/artifacts" TOOLS_DIR="$gate/tools" \
       FAKE_MODEL_RESULTS="$mode" FAKE_CARGO_LOG="$gate/cargo.log" \
-      FAKE_MCP_LOOM_BINARY="$gate/bin/mcp_loom" PATH="$gate/bin:$work/bin:$PATH" \
+      PATH="$gate/bin:$work/bin:$PATH" \
       bash scripts/qualify-ci.sh gate
   ) >"$gate/$mode.stdout" 2>"$gate/$mode.stderr"; then
     echo "model gate accepted $mode results" >&2
@@ -255,17 +247,17 @@ web_warning_calls() {
   )
   mapfile -t cargo_calls <"$gate/cargo.log"
   mapfile -t flags <"$gate/flags.log"
-  [[ "${#cargo_calls[@]}" -eq 4 ]] || return 1
-  local index features=(browser wasm browser,test-support)
-  for index in 0 1 2; do
+  [[ "${#cargo_calls[@]}" -eq 5 ]] || return 1
+  local index features=(browser wasm browser,test-support wasm,test-support)
+  for index in 0 1 2 3; do
     [[ "${cargo_calls[index]}" == "check --locked -p acyclic-harness --no-default-features --features ${features[index]} --target wasm32-unknown-unknown --lib --tests" ]] || return 1
   done
-  [[ "${cargo_calls[3]}" == 'check --locked -p acyclic-harness --no-default-features --target wasm32-unknown-unknown --lib' ]] || return 1
-  for index in 0 1 2 3; do [[ "${flags[index]}" == *-Dwarnings* ]] || return 1; done
+  [[ "${cargo_calls[4]}" == 'check --locked -p acyclic-harness --no-default-features --target wasm32-unknown-unknown --lib' ]] || return 1
+  for index in 0 1 2 3 4; do [[ "${flags[index]}" == *-Dwarnings* ]] || return 1; done
 }
 web_warning_calls scripts/qualify-ci.sh
 # Controls: the pin rejects a lane without test closures or warning denial.
-for mutation in 's/ --lib --tests$/ --lib/' 's/^    RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-Dwarnings" /    RUSTFLAGS="${RUSTFLAGS:-}" /'; do
+for mutation in 's/ --lib --tests$/ --lib/' 's/^    RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-Dwarnings" /    RUSTFLAGS="${RUSTFLAGS:-}" /' 's/ browser,test-support wasm,test-support/ browser,test-support/'; do
   sed "$mutation" "$root/scripts/qualify-ci.sh" >"$gate/qualify-mutated.sh"
   if cmp -s "$root/scripts/qualify-ci.sh" "$gate/qualify-mutated.sh"; then
     echo "web warning control did not apply: $mutation" >&2
@@ -276,6 +268,18 @@ for mutation in 's/ --lib --tests$/ --lib/' 's/^    RUSTFLAGS="${RUSTFLAGS:+$RUS
     exit 1
   fi
 done
+
+: >"$gate/cargo.log"
+(
+  cd "$root"
+  SDK_TEMP_DIR="$gate/temp" SDK_ARTIFACT_DIR="$gate/artifacts" TOOLS_DIR="$gate/tools" \
+    FAKE_CARGO_LOG="$gate/cargo.log" PATH="$gate/bin:$work/bin:$PATH" \
+    bash scripts/qualify-ci.sh wasm-tests
+)
+mapfile -t cargo_calls <"$gate/cargo.log"
+[[ "${#cargo_calls[@]}" -eq 2 ]]
+[[ "${cargo_calls[0]}" == 'check --locked -p acyclic-harness --no-default-features --features browser,test-support --target wasm32-unknown-unknown --lib --tests' ]]
+[[ "${cargo_calls[1]}" == 'check --locked -p acyclic-harness --no-default-features --features wasm,test-support --target wasm32-unknown-unknown --lib --tests' ]]
 
 for lane in docs generation; do
   : >"$gate/cargo.log"

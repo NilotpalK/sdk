@@ -3,8 +3,8 @@ use acyclic_harness::{
     local::LocalHarness,
     tui::{
         self, PromptBox, PromptInput, Viewport, crossterm,
-        ratatui::layout::Size,
-        term::{Environment, FrameTerminal, ScreenMode, Tty},
+        ratatui::layout::{Position, Rect, Size},
+        term::{Environment, FrameTerminal, RegionScroll, ScreenMode, Tty},
     },
 };
 use std::{sync::Arc, time::Instant};
@@ -38,12 +38,17 @@ pub async fn run(
         || crossterm::terminal::size().map(|(width, height)| Size::new(width, height));
     let mut terminal = FrameTerminal::new(output, terminal_size()?)?;
     let mut events = client::terminal_events(tty);
+    // Events of the current read not yet handled; the read presents one frame.
+    let mut batch = client::InputBatch::new();
+    let mut effects = Vec::new();
     let mut input = PromptInput::default();
     let mut prompt_files = client::PromptFiles::default();
     prompt_files.refresh(&commands, &mut input)?;
     let mut completions = client::local_completions(&local, &mut input).await?;
     let mut viewport = Viewport::default();
     let mut renderer = tui::ClientRenderer::default();
+    // The transcript band and its top line in the frame on the device.
+    let mut shown = None;
     let start = Instant::now();
     client.follow_commands(&commands).await?;
     let mut documents = client::local_documents(&local, client.views_mut()).await?;
@@ -65,48 +70,79 @@ pub async fn run(
         let mut areas = tui::ScreenAreas::default();
         let now = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
         let back = client::tui_scroll(&commands)?;
-        let mut maximum_scroll = 0;
         renderer.configure(client.views(), &authority, &commands)?;
         input.busy = renderer.is_busy();
         let size = terminal_size()?;
         renderer.layout(&commands, &input, size.width, size.height)?;
         let screen = renderer.screen_for(&commands)?;
-        terminal.draw(size, |frame| {
-            maximum_scroll = screen.tail_scroll(frame.area(), &input);
+        let area = Rect::from((Position::ORIGIN, size));
+        let maximum_scroll = screen.tail_scroll(area, &input);
+        if client::frame_due(&batch) {
             let scroll = maximum_scroll.saturating_sub(back);
-            areas = screen.render(frame, &input, &mut viewport, scroll, now);
-        })?;
-        let Some(event) = client::next_file_tui_event(
-            &mut client,
-            &mut events,
-            &mut completions,
-            &mut input,
-            &mut commands,
-            areas.animation,
-            &mut renderer,
-            &mut documents,
-        )
-        .await?
-        else {
-            continue;
-        };
-        let now = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let effects = input.event(
-            event,
-            PromptBox::input_area(areas.prompt),
-            &mut viewport,
-            now,
-        );
-        for effect in effects {
-            client::file_tui_input(
-                &mut commands,
-                reader.as_ref(),
-                effect,
-                usize::from(areas.transcript.height),
-                maximum_scroll,
-            )
-            .await?;
+            let transcript = screen.areas(area, &input).transcript;
+            present(
+                &mut terminal,
+                size,
+                &mut shown,
+                !inline,
+                (transcript, scroll),
+                |frame| {
+                    areas = screen.render(frame, &input, &mut viewport, scroll, now);
+                },
+            )?;
+        } else {
+            // More of this read is queued: route it against the same layout
+            // and present once, after the read.
+            areas = screen.areas(area, &input);
         }
+        if batch.is_empty() {
+            let Some(read) = client::next_file_tui_event(
+                &mut client,
+                &mut events,
+                &mut completions,
+                &mut input,
+                &mut commands,
+                areas.animation,
+                &mut renderer,
+                &mut documents,
+            )
+            .await?
+            else {
+                continue;
+            };
+            batch = read;
+        }
+        let now = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let area = PromptBox::input_area(areas.prompt);
+        let page_rows = usize::from(areas.transcript.height);
+        // A flick or held PageUp is one input batch: one scroll, one frame.
+        client::input_burst(&mut batch, page_rows, &mut effects, |event| {
+            input.event(event, area, &mut viewport, now)
+        });
+        client::file_tui_inputs(
+            &mut commands,
+            reader.as_ref(),
+            effects.drain(..),
+            page_rows,
+            maximum_scroll,
+        )
+        .await?;
         prompt_files.save(&mut commands, &mut input).await?;
     }
+}
+
+/// The presentation boundary shared by the executable and its file-backed Rig.
+/// Only successful device output advances the remembered transcript position.
+pub(super) fn present<P: tui::term::Present>(
+    terminal: &mut FrameTerminal<P>,
+    size: Size,
+    shown: &mut Option<(Rect, usize)>,
+    regions: bool,
+    (band, top): (Rect, usize),
+    render: impl FnOnce(&mut tui::ratatui::Frame<'_>),
+) -> std::io::Result<()> {
+    let moved = RegionScroll::between(shown.filter(|_| regions), band, top);
+    terminal.draw_scrolled(size, moved, render)?;
+    *shown = Some((band, top));
+    Ok(())
 }

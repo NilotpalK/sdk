@@ -30,6 +30,12 @@ mod tests {
 }
 
 impl StockExecutor {
+    #[cfg(all(feature = "hooks", feature = "filesystem", not(target_arch = "wasm32")))]
+    pub(crate) fn with_hooks(mut self, hooks: Option<Arc<crate::hooks::BoundHooks>>) -> Self {
+        self.hooks = hooks.filter(|hooks| hooks.rules.has_execution_hooks());
+        self
+    }
+
     /// Creates the stock loop without installing hidden stages or tools.
     #[must_use]
     pub fn new(
@@ -45,6 +51,8 @@ impl StockExecutor {
             provider,
             context,
             tools,
+            #[cfg(all(feature = "hooks", feature = "filesystem", not(target_arch = "wasm32")))]
+            hooks: None,
             limits: Limits::default(),
             tool_scope: RuntimeScope::default(),
             policy: None,
@@ -52,7 +60,7 @@ impl StockExecutor {
             task: None,
             inherited_prefix: None,
             task_context: None,
-            compaction: crate::context::CompactionPolicy::default(),
+            compaction: None,
             reconciliation_only: false,
         }
     }
@@ -69,7 +77,7 @@ impl StockExecutor {
     #[cfg(any(test, feature = "filesystem"))]
     pub(crate) fn with_summary_source(mut self, source: Option<Box<FileRef>>) -> Self {
         if source.is_some() {
-            self.compaction = crate::context::CompactionPolicy::Disabled;
+            self.compaction = Some(crate::context::CompactionPolicy::Disabled);
         }
         self.summary_source = source;
         self
@@ -78,7 +86,7 @@ impl StockExecutor {
     /// Replaces or disables the ordinary threshold policy without starting effects.
     #[must_use]
     pub fn with_compaction_policy(mut self, policy: crate::context::CompactionPolicy) -> Self {
-        self.compaction = policy;
+        self.compaction = Some(policy);
         self
     }
     /// Appends one validated context stage to the existing ordered pipeline.
@@ -209,6 +217,7 @@ impl StockExecutor {
         Ok(self)
     }
 
+    #[cfg(feature = "filesystem")]
     pub(crate) fn with_shared_task_context(
         mut self,
         context: Arc<crate::runtime::TaskContext>,

@@ -18,7 +18,7 @@ async fn reopen_finishes_a_retained_model_stop_before_running_the_next_message()
         ])
         .with_context_capacity(ModelContextCapacity {
             context_tokens: 32_768,
-            output_tokens: 4096,
+            output_tokens: Some(4096),
         })
         .with_dispatch_observer(move |_| {
             sent.send(()).unwrap();
@@ -30,11 +30,14 @@ async fn reopen_finishes_a_retained_model_stop_before_running_the_next_message()
         "1".into(),
         serde_json::Value::Null,
     )?;
+    // Every reopen shares one state directory outside the checkout.
+    let state = tempfile::tempdir().map_err(crate::local::storage)?;
     let config = || {
         crate::test_support::local_harness_config(
             directory.path(),
             (model.clone(), provider.clone()),
         )
+        .map(|config| config.state_directory(state.path()))
     };
     let harness = LocalHarness::open(config()?).await?;
     let operation = OperationId::new();
@@ -98,7 +101,18 @@ async fn reopen_finishes_a_retained_model_stop_before_running_the_next_message()
         !crate::local::children::cuts::armed(),
         "stopped journal cut was not reached"
     );
-    assert!(matches!(result, Err(Error::Indeterminate(_))));
+    // The cut stops the model command; its cause reaches the caller.
+    assert!(matches!(
+        result,
+        Err(Error::CommandIndeterminate {
+            cause: crate::CommandIndeterminacy {
+                command,
+                reason: crate::CommandIndeterminacyReason::Failed { code, .. },
+            },
+            ..
+        }) if command == crate::filesystem::MODEL_TASK_COMMAND_KIND
+            && code == "ERROR_CODE_INDETERMINATE"
+    ));
     let snapshot = files
         .observe(Query::Child(reference.clone()), None, 16)
         .await

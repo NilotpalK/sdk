@@ -170,6 +170,14 @@ pub(super) fn check_policy_metadata(
     Ok(())
 }
 
+// Negative-control seam for `hooks::mcp_identity_tests`: substitutes the
+// approval subject. It lives beside its only use so it exists in every build
+// that compiles this function, whatever features gate the tests reading it.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+thread_local! {
+    pub(crate) static SUBSTITUTE_APPROVAL_NAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 #[cfg(all(feature = "filesystem", not(target_arch = "wasm32")))]
 pub(super) fn validate_native_policy_decision(
     paid: &(ToolPolicyDecision, Option<NativeCustody>),
@@ -213,6 +221,16 @@ pub(crate) fn tool_approval_binding(
     crate::executor::with_history_io(io.as_ref(), |observed| {
         ToolInvocation::validate_identity(&invocation.call_id, Some(&invocation.name), observed)
     })?;
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    let substituted = SUBSTITUTE_APPROVAL_NAME
+        .with(std::cell::Cell::get)
+        .then(|| {
+            let mut substituted = invocation.clone();
+            substituted.name = "mcp__docs__search".into();
+            substituted
+        });
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    let invocation = substituted.as_ref().unwrap_or(invocation);
     let digest =
         crate::executor::preparation_digest(&(task, policy, definition, invocation), io.as_ref())?;
     let prefix = b"harness:tool-approval:v2";

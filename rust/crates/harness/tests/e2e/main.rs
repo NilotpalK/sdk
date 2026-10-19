@@ -2,6 +2,7 @@
 #[cfg(all(feature = "filesystem-local", feature = "native-execution"))]
 mod agents;
 mod composer;
+mod deadline_tests;
 mod discovery;
 mod drivers;
 mod execution;
@@ -10,7 +11,6 @@ mod limits_tests;
 mod local_admission;
 mod local_case;
 mod local_cloud;
-mod local_execution;
 mod local_tests;
 mod local_tool_files;
 mod local_tool_files_check;
@@ -21,18 +21,25 @@ mod notification_history;
 mod notifications;
 mod plan_query;
 mod plans;
+#[path = "../support/progress_guard.rs"]
+mod progress_guard;
+#[path = "../support/progress_guard_tests.rs"]
+mod progress_guard_tests;
+#[path = "../support/progress_registry.rs"]
+mod progress_registry;
 mod provider_case;
 mod provider_http;
 mod provider_tests;
 mod providers;
-mod remote_swarm;
-mod resume;
 #[path = "../support/quiescent.rs"]
 mod quiescent;
+mod remote_swarm;
+mod resume;
 mod runtime_tests;
 mod scenario;
 #[path = "../support/scenario_data.rs"]
 mod scenario_data;
+mod stall;
 mod subagents;
 mod swarm;
 mod swarm_case;
@@ -48,10 +55,14 @@ mod task_queries;
 mod task_query_case;
 mod task_query_tests;
 use acyclic_harness::context::CompactionPolicy;
-use drivers::run_execution as run;
+use drivers::run;
 use futures::{StreamExt as _, stream};
 use scenario::Scenario;
-use std::{path::Path, time::Instant};
+use std::{
+    path::Path,
+    sync::atomic::{AtomicUsize, Ordering},
+    time::Instant,
+};
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 use scenario_data::discover;
 
@@ -122,7 +133,7 @@ async fn scenario_oracles_reject_wrong_text_context_events_files_and_unused_turn
 
 #[tokio::test]
 async fn summary_oracles_reject_ignored_mode_text_result_context_and_recovery() -> TestResult {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/scenarios");
+    let root = Path::new(acyclic_harness::build_metadata::MANIFEST_DIR).join("tests/scenarios");
     let baseline = root.join("summary/exact-capacity.json");
     run(Scenario::load(&root, &baseline)?).await?;
     for field in ["mode", "text", "result", "context", "budget"] {
@@ -155,7 +166,7 @@ async fn summary_oracles_reject_ignored_mode_text_result_context_and_recovery() 
 
 #[tokio::test]
 async fn compaction_oracles_reject_ignored_context_capacity_policy_and_accounting() -> TestResult {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/scenarios");
+    let root = Path::new(acyclic_harness::build_metadata::MANIFEST_DIR).join("tests/scenarios");
     let baseline = root.join("compaction/threshold.json");
     run(Scenario::load(&root, &baseline)?).await?;
     for field in ["context", "capacity", "policy", "accounting", "output"] {
@@ -180,7 +191,7 @@ async fn compaction_oracles_reject_ignored_context_capacity_policy_and_accountin
 
 #[tokio::test]
 async fn compaction_oracles_check_the_attached_recovered_summary() -> TestResult {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/scenarios");
+    let root = Path::new(acyclic_harness::build_metadata::MANIFEST_DIR).join("tests/scenarios");
     let baseline = root.join("compaction/recover-summary.json");
     run(Scenario::load(&root, &baseline)?).await?;
     for files in [
@@ -203,7 +214,7 @@ async fn compaction_oracles_check_the_attached_recovered_summary() -> TestResult
 
 #[tokio::test]
 async fn recovery_oracles_reject_wrong_prefixes_replies_counts_and_attempts() -> TestResult {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/scenarios");
+    let root = Path::new(acyclic_harness::build_metadata::MANIFEST_DIR).join("tests/scenarios");
     let baseline = root.join("recovery/midstream.json");
     run(Scenario::load(&root, &baseline)?).await?;
     for field in ["prefix", "continuation", "count", "resume", "unused"] {
@@ -235,7 +246,7 @@ async fn recovery_oracles_reject_wrong_prefixes_replies_counts_and_attempts() ->
 
 #[test]
 fn scenarios() -> TestResult {
-    if std::env::var_os("E2E_TRACE").is_some() {
+    if acyclic_harness::test_support::environment("E2E_TRACE").is_some() {
         let _ = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::new(
                 "warn,acyclic_harness::filesystem::task_runtime::dispatch=trace",
@@ -277,57 +288,105 @@ async fn scenario_bootstrap_rejects_an_already_running_runtime() {
     );
 }
 
+/// Scenarios admitted per available CPU. Each admitted scenario holds a harness, its stores and its native work, so
+/// admission follows the machine rather than the corpus: a larger corpus queues instead of exhausting fixtures.
+const SCENARIOS_PER_CPU: usize = 4;
+
+/// The admission bound; `E2E_SCENARIO_CAPACITY` overrides it for measurement.
+fn scenario_capacity() -> TestResult<usize> {
+    let capacity = match acyclic_harness::test_support::environment("E2E_SCENARIO_CAPACITY")
+        .and_then(|value| value.into_string().ok())
+    {
+        Some(capacity) => capacity.parse()?,
+        None => std::thread::available_parallelism()?.get() * SCENARIOS_PER_CPU,
+    };
+    if capacity == 0 {
+        return Err("scenario capacity is zero".into());
+    }
+    Ok(capacity)
+}
+
 fn scenario_admission<I>(
     cases: I,
+    capacity: usize,
 ) -> impl futures::Stream<Item = <I::Item as std::future::Future>::Output>
 where
     I: ExactSizeIterator,
     I::Item: std::future::Future,
 {
-    let capacity = runtime_tests::admission_capacity(cases.len());
+    assert!(capacity > 0, "scenario capacity is zero");
+    let capacity = runtime_tests::admission_capacity(capacity).min(cases.len());
     stream::iter(cases).buffer_unordered(capacity)
 }
 
 async fn run_scenarios(started: Instant) -> TestResult {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/scenarios");
+    let mut guard = progress_guard::Guard::new();
+    let registry = guard.registry.clone();
+    let io = guard.io.clone();
+    guard
+        .run(run_guarded_scenarios(started, registry, io))
+        .await
+        .map_err(std::io::Error::other)?
+}
+
+async fn run_guarded_scenarios(
+    started: Instant,
+    registry: std::sync::Arc<progress_registry::Registry>,
+    io: acyclic_native_runtime::testing::Schedule,
+) -> TestResult {
+    let root = Path::new(acyclic_harness::build_metadata::MANIFEST_DIR).join("tests/scenarios");
     let mut paths = Vec::new();
     discover(&root, &mut paths)?;
     #[cfg(all(feature = "filesystem-local", feature = "native-execution"))]
-    let local_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/local-scenarios");
+    let local_root =
+        Path::new(acyclic_harness::build_metadata::MANIFEST_DIR).join("tests/local-scenarios");
     #[cfg(all(feature = "filesystem-local", feature = "native-execution"))]
     discover(&local_root, &mut paths)?;
     paths.sort();
-    if let Ok(filter) = std::env::var("E2E_FILTER") {
+    if let Some(filter) = acyclic_harness::test_support::environment("E2E_FILTER")
+        .and_then(|value| value.into_string().ok())
+    {
         paths.retain(|path| path.to_string_lossy().contains(&filter));
     }
     if paths.is_empty() {
         return Err("no scenarios discovered".into());
     }
     let count = paths.len();
-    let mut results = scenario_admission(paths.into_iter().map(|path| {
-        let root = root.clone();
-        #[cfg(all(feature = "filesystem-local", feature = "native-execution"))]
-        let root = if path.starts_with(&local_root) {
-            local_root.clone()
-        } else {
-            root
-        };
-        async move {
-            let case_path = path.clone();
-            let result: TestResult = tokio::spawn(async move {
-                let case = scenario::load_value(&root, &case_path)?;
-                drivers::run(case).await?;
-                Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
-            })
-            .await
-            .unwrap_or_else(|error| Err(Box::new(error)));
-            (path, result)
-        }
-    }));
+    let capacity = scenario_capacity()?;
+
+    let admitted = std::sync::Arc::new((AtomicUsize::new(0), AtomicUsize::new(0)));
+    let mut results = scenario_admission(
+        paths.into_iter().map(|path| {
+            let root = root.clone();
+            let admitted = admitted.clone();
+            let registry = registry.clone();
+            let io = io.clone();
+            #[cfg(all(feature = "filesystem-local", feature = "native-execution"))]
+            let root = if path.starts_with(&local_root) {
+                local_root.clone()
+            } else {
+                root
+            };
+            async move {
+                let case_path = path.clone();
+                let (running, peak) = &*admitted;
+                peak.fetch_max(running.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                let result: TestResult = stall::run(io, registry, case_path.clone(), async move {
+                    let case = scenario::load_value(&root, &case_path)?;
+                    drivers::run(case).await?;
+                    Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+                })
+                .await;
+                running.fetch_sub(1, Ordering::SeqCst);
+                (path, result)
+            }
+        }),
+        capacity,
+    );
     let mut failures = Vec::new();
     while let Some((path, result)) = results.next().await {
         let name = path
-            .strip_prefix(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests"))?
+            .strip_prefix(Path::new(acyclic_harness::build_metadata::MANIFEST_DIR).join("tests"))?
             .display();
         match result {
             Ok(()) => println!("PASS {name}"),
@@ -337,12 +396,18 @@ async fn run_scenarios(started: Instant) -> TestResult {
             }
         }
     }
+    let peak = admitted.1.load(Ordering::SeqCst);
     println!(
-        "{} scenarios, {} failed, {:.3}s",
+        "{} scenarios, {} failed, peak {} admitted of capacity {}, {:.3}s",
         count,
         failures.len(),
+        peak,
+        capacity,
         started.elapsed().as_secs_f64()
     );
+    if peak > capacity {
+        return Err(format!("{peak} scenarios ran at once, over capacity {capacity}").into());
+    }
     if !failures.is_empty() {
         return Err(format!("{} scenarios failed", failures.len()).into());
     }

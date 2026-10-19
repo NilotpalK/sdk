@@ -53,20 +53,20 @@ proptest::proptest! {
         use serde_json::json;
         let result = json!({"name":"read", "content":{"kind":"json","value":text}});
         let expected = std::collections::BTreeMap::from([("call".into(), result.clone())]);
-        proptest::prop_assert!(super::local_execution::check_results(&expected, &expected).is_ok());
+        proptest::prop_assert!(super::drivers::check_results(&expected, &expected).is_ok());
         let mut broken = expected.clone();
         broken.get_mut("call").unwrap()["content"]["value"] = json!(format!("{text}\0"));
-        proptest::prop_assert!(super::local_execution::check_results(&expected, &broken).is_err());
-        proptest::prop_assert!(super::local_execution::check_results(&expected, &Default::default()).is_err());
+        proptest::prop_assert!(super::drivers::check_results(&expected, &broken).is_err());
+        proptest::prop_assert!(super::drivers::check_results(&expected, &Default::default()).is_err());
         broken = expected.clone(); broken.insert("unexpected".into(), result);
-        proptest::prop_assert!(super::local_execution::check_results(&expected, &broken).is_err());
+        proptest::prop_assert!(super::drivers::check_results(&expected, &broken).is_err());
         broken = expected.clone(); broken.get_mut("call").unwrap()["name"] = "write".into();
-        proptest::prop_assert!(super::local_execution::check_results(&expected, &broken).is_err());
+        proptest::prop_assert!(super::drivers::check_results(&expected, &broken).is_err());
         use acyclic_harness::model::{Model, ModelContent, ModelContentPart, ModelMessage, ModelRequest, ModelRole, ToolResultContent};
         let part = ModelContentPart::ToolResult {call_id:"call".into(), name:"read".into(), content:ToolResultContent::Json {value:json!(text)}};
         let request = ModelRequest {model:Model::new("scripted".into(),"local".into(),"1".into(),json!(null))?,
             messages:vec![ModelMessage {role:ModelRole::Tool,content:ModelContent::Parts(vec![part.clone(),part])}], tools:vec![], max_output_tokens:None};
-        proptest::prop_assert!(super::local_execution::model_results(&request).is_err());
+        proptest::prop_assert!(super::drivers::model_results(&request).is_err());
     }
 }
 
@@ -117,22 +117,16 @@ fn local_schema_requires_outcome_frames_files_and_known_fields() -> crate::TestR
 
 #[tokio::test]
 async fn read_family_rejects_a_valid_but_wrong_selected_range() -> crate::TestResult {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/scenarios");
+    let root =
+        std::path::Path::new(acyclic_harness::build_metadata::MANIFEST_DIR).join("tests/scenarios");
     let baseline =
         super::scenario::load_value(&root, &root.join("default-tools/read/middle.json"))?;
-    tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        super::drivers::run(baseline.clone()),
-    )
-    .await??;
+    super::drivers::run(baseline.clone()).await?;
     let mut broken = baseline;
     broken["turns"][0][0]["arguments"]["range"]["start"] = 2.into();
-    let error = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        super::drivers::run(broken),
-    )
-    .await?
-    .expect_err("accepted the wrong selected bytes");
+    let error = super::drivers::run(broken)
+        .await
+        .expect_err("accepted the wrong selected bytes");
     assert!(error.to_string().contains("model tool result"), "{error}");
     Ok(())
 }
@@ -146,23 +140,26 @@ proptest::proptest! {
         let file = json!({"volume":{"provider":{"namespace":"fixture","family":"filesystem","version":"1"},
             "id":"project","class":"project","owner":{"kind":"project","id":"fixture"}},
             "path":"result","version":"v1","descriptor":{"sha256":vec![0;32],"byte_length":0,"media_type":"text/plain"},"display_name":"result"});
-        for outcome in [ExpectedOutcome::Succeeded,ExpectedOutcome::Indeterminate] {
+        for outcome in [ExpectedOutcome::Succeeded,ExpectedOutcome::Failed,ExpectedOutcome::Indeterminate] {
             let completed = match outcome {
                 ExpectedOutcome::Succeeded => json!({"Succeeded":file}),
-                ExpectedOutcome::Indeterminate => json!({"Indeterminate":{"operation_id":operation}}),
+                ExpectedOutcome::Failed => json!({"Failed":{"message":"expected failure"}}),
+                ExpectedOutcome::Indeterminate => json!({"Indeterminate":{"operation_id":operation,"cause":"Unobserved"}}),
             };
             let frames = vec![json!({"kind":"declared"}),json!({"kind":"admitted"}),json!({"kind":"completed","operation_id":operation,"outcome":completed,"fence":null})];
-            let check = |frames:&[serde_json::Value]| super::local_execution::check_frames(&expected,frames,operation,outcome);
+            let check = |frames:&[serde_json::Value]| super::drivers::check_frames(&expected,frames,operation,outcome);
             proptest::prop_assert!(check(&frames).is_ok());
             let mut duplicate = frames.clone();duplicate.push(frames[2].clone());
             proptest::prop_assert!(check(&duplicate).is_err());
             proptest::prop_assert!(check(&frames[..2]).is_err());
+            let mut cancelled = frames.clone();cancelled[2]["outcome"]=json!("Cancelled");
+            proptest::prop_assert!(check(&cancelled).is_err());
             let mut failed = frames.clone();failed[2]["outcome"]=json!({"Failed":{"message":"expected failure"}});
-            proptest::prop_assert!(check(&failed).is_err());
+            proptest::prop_assert_eq!(check(&failed).is_ok(), outcome == ExpectedOutcome::Failed);
             let mut foreign = id;foreign[0]^=1;
-            proptest::prop_assert!(super::local_execution::check_frames(&expected,&frames,acyclic_harness::OperationId::from_bytes(foreign),outcome).is_err());
+            proptest::prop_assert!(super::drivers::check_frames(&expected,&frames,acyclic_harness::OperationId::from_bytes(foreign),outcome).is_err());
             let other = if outcome == ExpectedOutcome::Succeeded {ExpectedOutcome::Indeterminate} else {ExpectedOutcome::Succeeded};
-            proptest::prop_assert!(super::local_execution::check_frames(&expected,&frames,operation,other).is_err());
+            proptest::prop_assert!(super::drivers::check_frames(&expected,&frames,operation,other).is_err());
             if outcome == ExpectedOutcome::Indeterminate {
                 let mut unbound = frames.clone();
                 unbound[2]["outcome"]["Indeterminate"]["operation_id"] = json!(acyclic_harness::OperationId::from_bytes(foreign));
@@ -216,44 +213,29 @@ async fn fs_family_rejects_executing_a_rejected_command() -> crate::TestResult {
 
 #[tokio::test]
 async fn fs_family_rejects_bypassing_schema_rejection() -> crate::TestResult {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/scenarios");
+    let root =
+        std::path::Path::new(acyclic_harness::build_metadata::MANIFEST_DIR).join("tests/scenarios");
     let baseline = super::scenario::load_value(&root, &root.join("default-tools/fs/empty.json"))?;
-    tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        super::drivers::run(baseline.clone()),
-    )
-    .await??;
+    super::drivers::run(baseline.clone()).await?;
     let mut broken = baseline;
     broken["turns"][0][0]["arguments"]["command"] = " \t\n".into();
-    let error = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        super::drivers::run(broken),
-    )
-    .await?
-    .expect_err("parser dispatch passed unchanged schema-rejection expectations");
-    assert!(
-        error.to_string().contains("scripted model turns"),
-        "{error}"
-    );
+    let error = super::drivers::run(broken)
+        .await
+        .expect_err("parser dispatch passed unchanged schema-rejection expectations");
+    assert!(error.to_string().contains("model tool result"), "{error}");
     Ok(())
 }
 
 async fn reject_changed_command(path: &str, command: &str) -> crate::TestResult {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/scenarios");
+    let root =
+        std::path::Path::new(acyclic_harness::build_metadata::MANIFEST_DIR).join("tests/scenarios");
     let baseline = super::scenario::load_value(&root, &root.join(path))?;
-    tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        super::drivers::run(baseline.clone()),
-    )
-    .await??;
+    super::drivers::run(baseline.clone()).await?;
     let mut broken = baseline;
     broken["turns"][0][0]["arguments"]["command"] = command.into();
-    let error = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        super::drivers::run(broken),
-    )
-    .await?
-    .expect_err("a different command passed unchanged family expectations");
+    let error = super::drivers::run(broken)
+        .await
+        .expect_err("a different command passed unchanged family expectations");
     assert!(error.to_string().contains("model tool result"), "{error}");
     Ok(())
 }

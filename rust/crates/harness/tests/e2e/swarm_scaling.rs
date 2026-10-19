@@ -5,7 +5,7 @@ use std::{collections::BTreeMap, path::Path, time::Instant};
 type Work = BTreeMap<&'static str, u64>;
 
 fn case(agents: usize, attention_every: usize) -> TestResult<SwarmCase> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/scenarios");
+    let root = Path::new(acyclic_harness::build_metadata::MANIFEST_DIR).join("tests/scenarios");
     let mut value = scenario::load_value(&root, &root.join("swarm/load/one-thousand.json"))?;
     value.as_object_mut().ok_or("case")?.remove("driver");
     let mut case: SwarmCase = serde_json::from_value(value)?;
@@ -18,7 +18,7 @@ fn case(agents: usize, attention_every: usize) -> TestResult<SwarmCase> {
 
 fn measured(case: SwarmCase, fault: Fault) -> TestResult<Work> {
     let agents = case.agents as u64;
-    let report = futures::executor::block_on(swarm::run_with_fault(case, fault, true))?;
+    let report = swarm::runtime()?.block_on(swarm::run_with_fault(case, fault, true))?;
     let mut work = Work::new();
     work.insert("agents", agents);
     for key in [

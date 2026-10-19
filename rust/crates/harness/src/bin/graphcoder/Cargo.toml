@@ -16,6 +16,7 @@ path = "../graphcoder.rs"
 acyclic-harness = { path = "../../..", features = ["filesystem-local", "native-execution", "terminal", "tui"] }
 acyclic-harness-providers = { path = "../../../../harness-providers" }
 clap.workspace = true
+dirs.workspace = true
 futures.workspace = true
 tokio = { workspace = true, features = ["rt", "macros", "io-std", "io-util"] }
 
@@ -34,6 +35,13 @@ alacritty_terminal = "0.26"
 [[test]]
 name = "cli"
 path = "tests/cli.rs"
+
+[[test]]
+name = "tui"
+path = "tests/tui.rs"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+rustix-openpty = "0.2"
 
 [dev-dependencies.axum]
 workspace = true

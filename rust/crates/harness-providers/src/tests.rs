@@ -27,6 +27,9 @@ mod argument_projection_tests;
 #[path = "call_id_tests.rs"]
 mod call_id_tests;
 #[cfg(not(target_arch = "wasm32"))]
+#[path = "catalog_identity_tests.rs"]
+pub(crate) mod catalog_identity_tests;
+#[cfg(not(target_arch = "wasm32"))]
 #[path = "catalog_tests.rs"]
 mod catalog_tests;
 #[cfg(not(target_arch = "wasm32"))]
@@ -40,12 +43,17 @@ mod gemini_tests;
 #[path = "input/projection_tests.rs"]
 mod input_projection_tests;
 #[cfg(not(target_arch = "wasm32"))]
+#[path = "native_retry_tests.rs"]
+mod native_retry_tests;
+#[cfg(not(target_arch = "wasm32"))]
 #[path = "native_tests.rs"]
 pub(crate) mod native_tests;
 #[path = "input/portable_projection_tests.rs"]
 mod portable_projection_tests;
 #[path = "tool_name_tests.rs"]
-mod tool_name_tests;
+pub(crate) mod tool_name_tests;
+#[path = "transport_tests.rs"]
+mod transport_tests;
 
 #[path = "ordered_parts_tests.rs"]
 mod ordered_parts_tests;
@@ -221,6 +229,12 @@ struct Script {
 }
 
 impl HttpTransport for Script {
+    fn delay(&self, wait: std::time::Duration) -> acyclic_stream::BoxProviderFuture<'static, ()> {
+        crate::fixtures::delay(wait)
+    }
+    fn now(&self) -> std::time::Duration {
+        crate::fixtures::now()
+    }
     fn send(&self, request: HttpRequest) -> BoxProviderFuture<'_, Result<HttpResponse>> {
         Box::pin(async move {
             if let Some(response) = fixture_count(&request) {
@@ -236,6 +250,7 @@ impl HttpTransport for Script {
                 .ok_or_else(|| invalid("missing fixture"))?
                 .1;
             Ok(HttpResponse {
+                retry_after: None,
                 status: self.status,
                 body: chunks(fixture, 1),
             })
@@ -257,6 +272,7 @@ fn fixture_count(request: &HttpRequest) -> Option<HttpResponse> {
     )
     .unwrap();
     Some(HttpResponse {
+        retry_after: None,
         status: 200,
         body: Box::pin(futures::stream::iter([Ok(body.into())])),
     })
@@ -268,9 +284,18 @@ fn provider(adapter: Adapter, status: u16) -> (ResolvedModel, Arc<Script>) {
         status,
         sent: Mutex::new(Vec::new()),
     });
-    let provider = ResolvedModel {
+    let provider = provider_with(adapter, "http://127.0.0.1:1234/v1", script.clone());
+    (provider, script)
+}
+
+pub(super) fn provider_with(
+    adapter: Adapter,
+    base_url: &str,
+    transport: Arc<dyn HttpTransport>,
+) -> ResolvedModel {
+    ResolvedModel {
         files: crate::files::Files::default(),
-        estimator: crate::accounting::TokenEstimator::new(adapter),
+        estimator: std::sync::Arc::new(crate::accounting::TokenEstimator::new(adapter)),
         model: Model {
             provider: "fixture".into(),
             name: "model".into(),
@@ -280,7 +305,7 @@ fn provider(adapter: Adapter, status: u16) -> (ResolvedModel, Arc<Script>) {
         config: Arc::new(ProviderSpec {
             adapter,
             authentication: Authentication::ApiKey,
-            base_url: "http://127.0.0.1:1234/v1".into(),
+            base_url: base_url.into(),
             headers: BTreeMap::new(),
             models: BTreeMap::new(),
             token_counter: Some(crate::TokenCounterSpec {
@@ -290,19 +315,20 @@ fn provider(adapter: Adapter, status: u16) -> (ResolvedModel, Arc<Script>) {
                 framing_tokens: 0,
             }),
             max_event_bytes: 4096,
+            retry: crate::RetrySpec::DEFAULT,
+            timeouts: crate::TimeoutSpec::DEFAULT,
         }),
         capacity: ModelContextCapacity {
             context_tokens: 8192,
-            output_tokens: 1024,
+            output_tokens: Some(1024),
         },
         key: Some("scripted-key".into()),
-        transport: script.clone(),
+        transport: crate::deadline::Bounded::new(transport, crate::TimeoutSpec::DEFAULT),
         #[cfg(not(target_arch = "wasm32"))]
-        codex_count: crate::codex_count::Counter::default(),
+        codex_count: std::sync::Arc::default(),
         #[cfg(not(target_arch = "wasm32"))]
         codex_login: None,
-    };
-    (provider, script)
+    }
 }
 
 pub(super) fn request(provider: &ResolvedModel) -> Result<(PreparedModelRequest, ModelDispatch)> {
@@ -465,9 +491,10 @@ fn registry_rejects_unsafe_urls_and_preserves_model_slashes() -> Result<()> {
         models: BTreeMap::from([(
             "org/model".into(),
             ModelSpec {
+                max_context_tokens: None,
                 capacity: ModelContextCapacity {
                     context_tokens: 8192,
-                    output_tokens: 1024,
+                    output_tokens: Some(1024),
                 },
                 features: ModelFeatures::default(),
             },
@@ -479,6 +506,8 @@ fn registry_rejects_unsafe_urls_and_preserves_model_slashes() -> Result<()> {
             framing_tokens: 0,
         }),
         max_event_bytes: 4096,
+        retry: crate::RetrySpec::DEFAULT,
+        timeouts: crate::TimeoutSpec::DEFAULT,
     };
     for base in [
         "http://example.test",
@@ -504,7 +533,23 @@ fn registry_rejects_unsafe_urls_and_preserves_model_slashes() -> Result<()> {
 #[tokio::test]
 async fn tool_history_round_trips_call_identity_and_arguments_in_every_protocol() -> Result<()> {
     use acyclic_harness::model::{ModelContentPart, ToolResultContent};
-    for (adapter, _) in fixtures() {
+    for (adapter, content, expected) in fixtures().into_iter().flat_map(|(adapter, _)| {
+        [
+            (
+                ToolResultContent::Json {
+                    value: json!({"value":1}),
+                },
+                "{\"value\":1}",
+            ),
+            (
+                ToolResultContent::Error {
+                    message: "denied é 🦀".into(),
+                },
+                "denied é 🦀",
+            ),
+        ]
+        .map(move |(content, expected)| (adapter, content, expected))
+    }) {
         let (provider, script) = provider(adapter, 200);
         let tool = acyclic_harness::tool::ToolDefinition {
             name: "echo".into(),
@@ -514,6 +559,7 @@ async fn tool_history_round_trips_call_identity_and_arguments_in_every_protocol(
             output_schema: json!({"type":"object"}),
             projection_schema: json!({"type":"object"}),
         };
+        let is_error = matches!(content, ToolResultContent::Error { .. });
         let request = ModelRequest {
             model: provider.model.clone(),
             max_output_tokens: Some(64),
@@ -538,9 +584,7 @@ async fn tool_history_round_trips_call_identity_and_arguments_in_every_protocol(
                     content: ModelContent::Part(ModelContentPart::ToolResult {
                         call_id: "call".into(),
                         name: "echo".into(),
-                        content: ToolResultContent::Json {
-                            value: json!({"value":1}),
-                        },
+                        content,
                     }),
                 },
             ],
@@ -579,18 +623,25 @@ async fn tool_history_round_trips_call_identity_and_arguments_in_every_protocol(
                     "{\"value\":1}"
                 );
                 assert_eq!(body["messages"][2]["tool_call_id"], "call");
+                assert_eq!(body["messages"][2]["content"], expected);
                 assert_eq!(body["tools"][0]["function"]["parameters"]["type"], "object");
             }
             Adapter::Anthropic => {
                 assert_eq!(body["messages"][1]["content"][0]["id"], "call");
                 assert_eq!(body["messages"][2]["content"][0]["tool_use_id"], "call");
                 assert_eq!(body["messages"][2]["role"], "user");
+                assert_eq!(body["messages"][2]["content"][0]["content"], expected);
+                assert_eq!(
+                    body["messages"][2]["content"][0]["is_error"],
+                    if is_error { json!(true) } else { Value::Null }
+                );
                 assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
             }
             Adapter::Responses => {
                 assert_eq!(body["input"][1]["call_id"], "call");
                 assert_eq!(body["input"][2]["type"], "function_call_output");
                 assert_eq!(body["input"][2]["call_id"], "call");
+                assert_eq!(body["input"][2]["output"], expected);
                 assert_eq!(body["tools"][0]["parameters"]["type"], "object");
             }
             Adapter::Gemini => {
@@ -601,6 +652,14 @@ async fn tool_history_round_trips_call_identity_and_arguments_in_every_protocol(
                 assert_eq!(
                     body["contents"][2]["parts"][0]["functionResponse"]["id"],
                     "call"
+                );
+                assert_eq!(
+                    body["contents"][2]["parts"][0]["functionResponse"]["response"],
+                    if is_error {
+                        json!({"error": expected})
+                    } else {
+                        json!({"output": expected})
+                    }
                 );
                 assert_eq!(
                     body["tools"][0]["functionDeclarations"][0]["parametersJsonSchema"]["type"],
@@ -681,3 +740,6 @@ mod reasoning;
 
 #[path = "files_tests.rs"]
 mod files;
+
+#[path = "catalog_capacity_tests.rs"]
+mod catalog_capacity_tests;

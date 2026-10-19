@@ -77,11 +77,14 @@ pub struct Output {
 pub(crate) const CONSOLE_CHUNK: usize = 256 * 1024;
 
 impl super::Present for Output {
-    fn present(&mut self, frame: &mut Vec<u8>, cursor_hidden: bool) -> io::Result<()> {
+    fn supports_scroll_regions(&self) -> bool {
+        self.owner.supports_scroll_regions()
+    }
+    fn present(&mut self, frame: &mut Vec<u8>, effects: super::FrameEffects) -> io::Result<()> {
         let owner = &self.owner;
         let presented = super::frame::present_parts(frame, CONSOLE_CHUNK, |part| {
             Owner::run(owner, Instant::now() + PROBE_TIMEOUT, move |guard| {
-                part.apply(guard, cursor_hidden)
+                part.apply(guard, effects)
             })
         });
         if presented.is_err() {
@@ -94,7 +97,7 @@ impl super::Present for Output {
     fn present_if_current(
         &mut self,
         frame: &mut Vec<u8>,
-        cursor_hidden: bool,
+        effects: super::FrameEffects,
         expected: Option<u64>,
     ) -> io::Result<Option<u64>> {
         if frame.is_empty() {
@@ -116,7 +119,7 @@ impl super::Present for Output {
                         Ok(None)
                     };
                 }
-                part.apply(guard, cursor_hidden)?;
+                part.apply(guard, effects)?;
                 Ok(count)
             })?;
             rejected = accepted.is_none();
@@ -252,6 +255,11 @@ impl Tty {
     }
 }
 impl ProbeIo for Tty {
+    // open() succeeded only after enabling native VT processing.
+    fn native_scroll_regions(&self) -> bool {
+        true
+    }
+
     fn send(&mut self, mut bytes: &[u8], deadline: Instant) -> io::Result<()> {
         if Instant::now() >= deadline {
             return Err(io::ErrorKind::TimedOut.into());
@@ -307,6 +315,10 @@ impl Drop for Tty {
         let _ = self.restore();
     }
 }
+
+#[cfg(test)]
+#[path = "windows_wheel_tests.rs"]
+mod wheel_tests;
 
 #[cfg(test)]
 mod tests {
@@ -405,6 +417,7 @@ mod tests {
         std::fs::write(path.with_extension("negotiated"), b"negotiated")?;
         tty.setup(ScreenMode::Alternate)?;
         std::fs::write(path.with_extension("setup"), b"setup")?;
+        wheel_tests::read_bursts(&mut tty, &path)?;
         tty.enable_mode(1004)?;
         let blocked = std::env::var("ACYCLIC_TERMINAL_WINDOWS_EVENT").as_deref() == Ok("blocked");
         let payload = vec![b'B'; 1024 * 1024];

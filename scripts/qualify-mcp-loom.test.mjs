@@ -2,13 +2,114 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import test from "node:test";
-import { qualifyMcpLoom, qualifyTimerLoom, qualifyGuestLoom, qualifyFsBindingLoom, qualifyMemoryAccountingLoom, qualifyCoordinatorOriginsLoom, qualifySummaryCheckpointsLoom, qualifyHookLifecycleLoom } from "./qualify-mcp-loom.mjs";
+import { qualificationMain } from "./qualify-mcp-loom.mjs";
+import { gateQualifications, qualifyMcpLoom, qualifyTimerLoom, qualifyGuestLoom, qualifyFsBindingLoom, qualifyMemoryAccountingLoom, qualifyCoordinatorOriginsLoom, qualifySummaryCheckpointsLoom, qualifyHookLifecycleLoom, qualifyE2eProgressLoom, qualifyNativeProgressLoom, qualifySessionFsLoom, qualifyOwnershipLoom, qualifyNativeRegistryLoom } from "./qualify-mcp-loom.mjs";
 
 const artifact = { reason: "compiler-artifact", target: { name: "mcp-loom" }, profile: { test: true }, executable: "model-binary" };
 const summary = (passed, ignored = 0, filtered = 0) => `test result: ok. ${passed} passed; 0 failed; ${ignored} ignored; 0 measured; ${filtered} filtered out;\n`;
 
+test("gate rejects every trailing argument before starting a build", () => {
+  for (const trailing of [["--bogus"], ["--features", "x"], ["--all-features"], ["--timer"], ["--gate"], ["x"]]) {
+    let builds = 0;
+    const run = () => { builds++; throw new Error("unexpected build"); };
+    assert.throws(() => qualificationMain(["--gate", ...trailing], run), /unknown qualification argument/);
+    assert.equal(builds, 0);
+  }
+});
+
+function assertGateStep(args) {
+  const gate = readFileSync("scripts/qualify-ci.sh", "utf8").match(/  gate\)\n([\s\S]*?);;/)?.[1];
+  assert.match(gate, /node scripts\/qualify-mcp-loom\.mjs --gate/);
+  assert.ok(gateQualifications.some(step => JSON.stringify(step.args) === JSON.stringify(args)), `missing gate step: ${args}`);
+}
+
+test("ownership qualification requires every dedicated real-lock model and compiler controls in CI", () => {
+  for (const passed of [0, 4, 7, 8, 9]) {
+    const run = (command, args, options) => {
+      if (command === "cargo") {
+        assert.deepEqual(args.slice(0, 7), ["test", "--locked", "--message-format=json", "-p", "acyclic-native-runtime", "--lib", "--no-run"]);
+        assert.match(options.env.RUSTFLAGS, /--cfg acyclic_native_runtime_loom(?: |$)/);
+        return {status: 0, stderr: "", stdout: JSON.stringify({...artifact, target: {name: "acyclic_native_runtime"}})};
+      }
+      assert.deepEqual(args, ["ownership::model::"]);
+      assert.equal(options.timeout, 9500);
+      return {status: 0, stderr: "", stdout: summary(passed, 0, 50)};
+    };
+    if (passed === 8) qualifyOwnershipLoom(run);
+    else assert.throws(() => qualifyOwnershipLoom(run), /requires a nonzero/);
+  }
+  const gate = readFileSync("scripts/qualify-ci.sh", "utf8").match(/  gate\)\n([\s\S]*?);;/)?.[1];
+  const requireProofs = text => {
+    assert.match(text, /^    node scripts\/check-hermetic-clippy\.mjs$/m);
+    assertGateStep(["--ownership"]);
+  };
+  requireProofs(gate);
+  for (const line of ["    node scripts/check-hermetic-clippy.mjs"]) {
+    assert.throws(() => requireProofs(gate.replace(line, "")), assert.AssertionError);
+  }
+});
+
+test("progress qualification requires the cleanup and runnable-wake models and controls", () => {
+  const names = ["registration_reporting_and_cancel_or_panic_cleanup_are_atomic",
+    "forgotten_cleanup_is_detected_on_the_real_registration",
+    "polling_wake_and_reporting_never_lose_runnability",
+    "an_unobserved_wake_fails_the_same_runnability_oracle"];
+  for (const missing of [null, 1, 2, 3, 4]) {
+    let models = 0;
+    const run = (command, args) => {
+      if (command === "cargo") {
+        assert.deepEqual(args.slice(-3), ["--", "--cfg", "acyclic_e2e_progress_loom"]);
+        return {status: 0, stdout: JSON.stringify({...artifact, target: {name: "e2e-progress-model"}})};
+      }
+      assert.equal(args[0], names[models++]);
+      return {status: 0, stdout: summary(models === missing ? 0 : 1, 0, 1)};
+    };
+    if (missing === null) { qualifyE2eProgressLoom(undefined, run); assert.equal(models, 4); }
+    else assert.throws(() => qualifyE2eProgressLoom(undefined, run), /requires a nonzero/);
+  }
+});
+
+test("native progress qualification instruments the real mutex and requires every ownership model", () => {
+  for (const missing of [null, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]) {
+    let models = 0;
+    const run = (command, args, options) => {
+      if (command === "cargo") {
+        assert.match(options.env.RUSTFLAGS, /--cfg acyclic_native_runtime_loom/);
+        assert.ok(args.includes("--lib") && args.includes("--no-run"));
+        return {status: 0, stdout: JSON.stringify({...artifact, target: {name: "acyclic_native_runtime"}})};
+      }
+      assert.match(args[0], /^testing::(?:queue_)?model::/);
+      return {status: 0, stdout: summary(++models === missing ? 0 : 1, 0, 4)};
+    };
+    if (missing === null) { qualifyNativeProgressLoom(run); assert.equal(models, 13); }
+    else assert.throws(() => qualifyNativeProgressLoom(run), /requires a nonzero/);
+  }
+});
+
+test("fs Session qualification instruments real provider and Session locks and requires every model", () => {
+  for (const missing of [null, 1, 2, 3, 4, 5, 6, 7]) {
+    let models = 0;
+    const run = (command, args, options) => {
+      if (command === "cargo") {
+        assert.match(options.env.RUSTFLAGS, /--cfg acyclic_loom/);
+        assert.match(options.env.RUSTFLAGS, /--cfg acyclic_stream_loom/);
+        assert.ok(args.includes("memory,session,acyclic-stream/local"));
+        assert.ok(args.includes("session_fs_model"));
+        return { status: 0, stderr: "", stdout: JSON.stringify({ ...artifact, target: { name: "session_fs_model" } }) };
+      }
+      assert.equal(args[1], "--exact");
+      assert.equal(options.timeout, 9500);
+      models++;
+      return { status: 0, stderr: "", stdout: summary(models === missing ? 0 : 1, 0, 2) };
+    };
+    if (missing === null) { qualifySessionFsLoom(run); assert.equal(models, 7); }
+    else assert.throws(() => qualifySessionFsLoom(run), /requires a nonzero/);
+  }
+  assertGateStep(["--session-fs"]);
+});
+
 test("hook qualification builds real synchronization once and rejects either missing model", () => {
-  for (const missing of [null, 1, 2]) {
+  for (const missing of [null, ...Array.from({ length: 13 }, (_, i) => i + 1)]) {
     let models = 0;
     const run = (command, args, options) => {
       if (command === "cargo") {
@@ -16,17 +117,17 @@ test("hook qualification builds real synchronization once and rejects either mis
         assert.match(options.env.RUSTFLAGS, /--cfg acyclic_loom/);
         return { status: 0, stderr: "", stdout: JSON.stringify({ ...artifact, target: { name: "acyclic_harness" } }) };
       }
-      assert.ok(args[0].includes(models === 0 ? "competing_dispatches_claim_once" : "cancellation_keeps_hook_workers"));
+      if (models < 2) assert.ok(args[0].includes(models === 0 ? "competing_dispatches_claim_once" : "cancellation_keeps_hook_workers"));
+      else assert.match(args[0], /(?:cancelled_(?:hook|bash)_retains_projection|local::workspace::projection::tests::)/);
       assert.equal(args[1], "--exact");
       assert.equal(options.timeout, 9500);
       models++;
       return { status: 0, stderr: "", stdout: summary(models === missing ? 0 : 1, 0, 100) };
     };
-    if (missing === null) { qualifyHookLifecycleLoom(undefined, run); assert.equal(models, 2); }
+    if (missing === null) { qualifyHookLifecycleLoom(undefined, run); assert.equal(models, 13); }
     else assert.throws(() => qualifyHookLifecycleLoom(undefined, run), /requires a nonzero/);
   }
-  const gate = readFileSync("scripts/qualify-ci.sh", "utf8").match(/  gate\)\n([\s\S]*?);;/)?.[1];
-  assert.match(gate, /node scripts\/qualify-mcp-loom\.mjs --hook-lifecycle/);
+  assertGateStep(["--hook-lifecycle", "--all-features"]);
 });
 
 test("qualification opts into the crate cfg only for the model build and executes its binary", () => {
@@ -41,10 +142,9 @@ test("qualification opts into the crate cfg only for the model build and execute
     ["model-binary", []],
   ]);
   const qualification = readFileSync("scripts/qualify-ci.sh", "utf8");
-  const gate = qualification.match(/  gate\)\n([\s\S]*?);;/)?.[1];
-  assert.match(gate, /node scripts\/qualify-mcp-loom\.mjs --all-features/);
-  assert.match(gate, /node scripts\/qualify-mcp-loom\.mjs --timer/);
-  assert.match(gate, /node scripts\/qualify-mcp-loom\.mjs --guest/);
+  assertGateStep(["--all-features"]);
+  assertGateStep(["--timer"]);
+  assertGateStep(["--guest"]);
   const policy = qualification.match(/  policy\)\n([\s\S]*?);;/)?.[1];
   assert.match(policy, /node --test[^\n]*scripts\/qualify-mcp-loom\.test\.mjs/);
 });
@@ -104,9 +204,8 @@ test("filesystem qualification models the production mutex only in its dedicated
     ["cargo", ["rustc", "--locked", "--message-format=json", "-p", "acyclic-fs", "--test", "native_binding_model", "--all-features", "--", "--cfg", "acyclic_fs_loom"]],
     ["model-binary", []],
   ]);
-  const gate = readFileSync("scripts/qualify-ci.sh", "utf8").match(/  gate\)\n([\s\S]*?);;/)?.[1];
-  assert.match(gate, /node scripts\/qualify-mcp-loom\.mjs --fs-binding --all-features/);
-  assert.match(gate, /node scripts\/qualify-mcp-loom\.mjs --memory-accounting/);
+  assertGateStep(["--fs-binding", "--all-features"]);
+  assertGateStep(["--memory-accounting"]);
 });
 
 test("memory accounting instruments dependency cancellation and the real ledger mutex", () => {
@@ -161,5 +260,26 @@ test("summary checkpoint qualification instruments real locks and requires both 
     else assert.throws(() => qualifySummaryCheckpointsLoom(undefined, run), /requires a nonzero/);
     assert.deepEqual(calls[1], ["model-binary", ["local::compact::checkpoints::model::"]]);
   }
-  assert.match(readFileSync("scripts/qualify-ci.sh", "utf8"), /node scripts\/qualify-mcp-loom\.mjs --summary-checkpoints --all-features/);
+  assertGateStep(["--summary-checkpoints", "--all-features"]);
+});
+
+test("registry gate instruments real native locks and rejects either omitted proof", () => {
+  for (const missing of [null, 1, 2]) {
+    let models = 0;
+    const run = (command, args, options) => {
+      if (command === "cargo") {
+        assert.match(options.env.RUSTFLAGS, /--cfg acyclic_fs_native_loom/);
+        assert.ok(args.includes("--lib"));
+        return { status: 0, stderr: "", stdout: JSON.stringify({ ...artifact, target: { name: "acyclic_fs" } }) };
+      }
+      assert.match(args[0], /native_mount::fence::models::/);
+      assert.equal(args[1], "--exact");
+      assert.equal(options.timeout, 9500);
+      models++;
+      return { status: 0, stderr: "", stdout: summary(models === missing ? 0 : 1, 0, 100) };
+    };
+    if (missing === null) { qualifyNativeRegistryLoom(run); assert.equal(models, 2); }
+    else assert.throws(() => qualifyNativeRegistryLoom(run), /requires a nonzero/);
+  }
+  assertGateStep(["--native-registry"]);
 });

@@ -181,7 +181,7 @@ fn task_model(turns: impl IntoIterator<Item = ScriptedTurn>) -> ScriptedModelPro
     ScriptedModelProvider::new(turns)
         .with_context_capacity(acyclic_harness::context::ModelContextCapacity {
             context_tokens: 131_072,
-            output_tokens: 16_384,
+            output_tokens: Some(16_384),
         })
         .with_token_counter(|request| {
             let message_tokens = request
@@ -251,9 +251,7 @@ fn interrupted_model(observed_events: usize) -> Arc<ScriptedModelProvider> {
 }
 
 fn workspace() -> Result<tempfile::TempDir> {
-    let root = env!("CARGO_TARGET_TMPDIR");
-    std::fs::create_dir_all(root).map_err(|error| Error::Storage(error.to_string()))?;
-    tempfile::tempdir_in(root).map_err(|error| Error::Storage(error.to_string()))
+    tempfile::tempdir().map_err(|error| Error::Storage(error.to_string()))
 }
 
 struct TaskMachine {

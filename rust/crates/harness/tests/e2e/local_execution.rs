@@ -1,4 +1,4 @@
-use super::{
+use crate::{
     TestResult,
     local_case::{ExpectedOutcome, LocalCase},
     local_workspace, matchers,
@@ -10,6 +10,7 @@ use acyclic_harness::{
     context::{CompactionPolicy, ContextRoot, PinnedContextPath},
     conversation::{FileDescriptor, FileRef},
     model::{Model, ModelContent, ModelContentPart, ModelEvent, ModelRequest},
+    native_settings::SettingsConfig,
     task_volume::{FileQuerySource, Query},
     test_support::{
         ScriptedEvent, ScriptedModelProvider, ScriptedTurn, local_harness_config, local_task_stream,
@@ -69,10 +70,35 @@ pub(super) async fn run(case: LocalCase) -> TestResult {
             entry.insert(serde_json::to_value(file)?);
         }
     }
-    let turns = super::local_case::bind_seed_files(case.turns, &references)?;
-    let scripted_calls = super::local_tool_files::calls(&turns);
+    let turns = crate::local_case::bind_seed_files(case.turns, &references)?;
+    let mut scripted_calls = crate::local_tool_files::calls(&turns);
+    for (call_id, arguments) in &case.expect.arguments {
+        let (_, call) = scripted_calls
+            .iter_mut()
+            .find(|(_, call)| &call.call_id == call_id)
+            .ok_or("rewritten arguments name no scripted bash call")?;
+        call.arguments = arguments.clone();
+    }
+    // A refused call never ran, so it publishes no tool request or result files.
+    scripted_calls.retain(|(_, call)| {
+        case.expect.results.as_ref().is_none_or(|results| {
+            results
+                .get(&call.call_id)
+                .is_none_or(|result| result["content"]["kind"] != "error")
+        })
+    });
     let provider = Arc::new(ScriptedModelProvider::new(turns));
+    let home = temporary.path().join("home");
+    for (path, text) in &case.home {
+        let path = home.join(path);
+        std::fs::create_dir_all(path.parent().ok_or("home file has no parent")?)?;
+        match text {
+            Value::String(text) => std::fs::write(path, text)?,
+            value => std::fs::write(path, serde_json::to_vec(value)?)?,
+        }
+    }
     let config = local_harness_config(&directory, (model, provider.clone()))?
+        .settings(SettingsConfig::new(&directory, &home).codex_home(home.join(".codex")))
         .state_directory(&state)
         .volume(volume.clone())
         .compaction(CompactionPolicy::Disabled)
@@ -83,18 +109,31 @@ pub(super) async fn run(case: LocalCase) -> TestResult {
     }
     let stream = local_task_stream(&harness);
     let (operation, task_id, status) =
-        super::local_admission::submit(&harness, &case.prompt, reader.as_ref()).await?;
-    let tool_files = super::local_tool_files::observe(&harness, task_id, &scripted_calls).await?;
+        crate::local_admission::submit(&harness, &case.prompt, reader.as_ref()).await?;
+    let tool_files = crate::local_tool_files::observe(&harness, task_id, &scripted_calls).await?;
     let mut frames = stream
         .follow(StreamPath::new("harness/v3/coordinator/events")?, 0)
         .await?;
     let output = harness.resume(task_id).await;
-    super::local_admission::settled(&harness, task_id, status, &case.expect.statuses).await?;
+    crate::local_admission::settled(&harness, task_id, status, &case.expect.statuses).await?;
     match (case.expect.outcome, output) {
         (ExpectedOutcome::Succeeded, Ok(output))
             if Some(&output.text) == case.expect.text.as_ref() => {}
-        (ExpectedOutcome::Indeterminate, Err(acyclic_harness::Error::Indeterminate(id)))
-            if id == operation => {}
+        (ExpectedOutcome::Failed, Err(acyclic_harness::Error::TaskFailed { task, .. }))
+            if task == task_id && case.expect.error.is_none() => {}
+        // A local turn is uncertain only through a command, so the caller sees its cause.
+        (
+            ExpectedOutcome::Indeterminate,
+            Err(acyclic_harness::Error::CommandIndeterminate {
+                operation_id: id, ..
+            }),
+        ) if id == operation => {}
+        (ExpectedOutcome::Failed, Err(error))
+            if case
+                .expect
+                .error
+                .as_deref()
+                .is_some_and(|expected| error.to_string().contains(expected)) => {}
         (_, actual) => return Err(format!("local turn outcome differs: {actual:?}").into()),
     }
     if provider.remaining() != 0 {
@@ -104,6 +143,7 @@ pub(super) async fn run(case: LocalCase) -> TestResult {
     if requests.len() != steps {
         return Err("local scenario did not consume exactly its scripted model turns".into());
     }
+    check_requests(&case.expect, &requests)?;
     if let Some(expected) = &case.expect.results {
         let actual = model_results(requests.last().ok_or("missing model request")?)?;
         check_results(expected, &actual)?;
@@ -136,7 +176,7 @@ pub(super) async fn run(case: LocalCase) -> TestResult {
         {
             return Err("local model execution or step binding differs".into());
         }
-        super::local_tool_files::verify(
+        crate::local_tool_files::verify(
             &harness,
             task_id,
             execution,
@@ -153,7 +193,9 @@ pub(super) async fn run(case: LocalCase) -> TestResult {
     let cut = stream.tail(path).await?;
     let mut wire_frames = Vec::new();
     for sequence in 0..cut {
-        let record = frames.next().await.ok_or("scheduler wire ended")??;
+        let record = crate::stall::waiting("scheduler wire replay", frames.next())
+            .await
+            .ok_or("scheduler wire ended")??;
         if record.sequence != sequence {
             return Err("scheduler wire has a sequence gap".into());
         }
@@ -195,11 +237,12 @@ pub(super) async fn run(case: LocalCase) -> TestResult {
     let mut paths = std::collections::BTreeSet::new();
     let mut removed = std::collections::BTreeSet::new();
     while seen != target.cursor.position {
-        let change = observation
-            .changes
-            .next()
-            .await
-            .ok_or("diff follow ended")??;
+        let change = crate::stall::waiting(
+            "workspace follow before the settled cut",
+            observation.changes.next(),
+        )
+        .await
+        .ok_or("diff follow ended")??;
         if change.cursor.position <= seen || change.cursor.position > target.cursor.position {
             return Err("diff publication cursor did not advance to the accepted cut".into());
         }
@@ -326,6 +369,10 @@ pub(super) async fn run(case: LocalCase) -> TestResult {
             }
         }
     }
+    if requests.is_empty() {
+        // Only a failed case may stop before dispatch; validate() requires it.
+        return Ok(());
+    }
     if ["bash", "fs", "read", "write", "edit"]
         .iter()
         .any(|name| !requests[0].tools.iter().any(|tool| tool.name == *name))
@@ -339,6 +386,28 @@ pub(super) async fn run(case: LocalCase) -> TestResult {
         .any(|message| message.content == prompt)
     {
         return Err("local scenario prompt was lost before model dispatch".into());
+    }
+    Ok(())
+}
+
+fn check_requests(
+    expected: &crate::local_case::Expectations,
+    requests: &[ModelRequest],
+) -> TestResult {
+    let requests = requests
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<Result<Vec<_>, _>>()?;
+    if let Some(expected) = &expected.requests {
+        matchers::ordered(expected, &requests, "requests")?;
+    }
+    for forbidden in &expected.not_requests {
+        if requests
+            .iter()
+            .any(|request| matchers::subset(forbidden, request))
+        {
+            return Err(format!("forbidden request: {forbidden}").into());
+        }
     }
     Ok(())
 }
@@ -363,7 +432,7 @@ fn rendered_files(view: &DiffView) -> TestResult<std::collections::BTreeMap<Stri
         .collect()
 }
 
-pub(super) fn check_frames(
+pub(crate) fn check_frames(
     expected: &[Value],
     frames: &[Value],
     operation: OperationId,
@@ -394,17 +463,24 @@ pub(super) fn check_frames(
         (
             ExpectedOutcome::Indeterminate,
             acyclic_harness::scheduler::SchedulerEvent::Completed {
-                outcome: acyclic_harness::Outcome::Indeterminate { operation_id },
+                outcome: acyclic_harness::Outcome::Indeterminate { operation_id, .. },
                 ..
             },
         ) if operation_id == identity => {}
+        (
+            ExpectedOutcome::Failed,
+            acyclic_harness::scheduler::SchedulerEvent::Completed {
+                outcome: acyclic_harness::Outcome::Failed { .. },
+                ..
+            },
+        ) => {}
         _ => return Err("local task wire outcome differs".into()),
     }
     matchers::ordered(expected, frames, "scheduler wire frames")?;
     Ok(())
 }
 
-pub(super) fn model_results(
+pub(crate) fn model_results(
     request: &ModelRequest,
 ) -> TestResult<std::collections::BTreeMap<String, Value>> {
     let mut results = std::collections::BTreeMap::new();
@@ -424,7 +500,7 @@ pub(super) fn model_results(
     Ok(results)
 }
 
-pub(super) fn check_results(
+pub(crate) fn check_results(
     expected: &std::collections::BTreeMap<String, Value>,
     actual: &std::collections::BTreeMap<String, Value>,
 ) -> TestResult {

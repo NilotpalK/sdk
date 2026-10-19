@@ -132,11 +132,11 @@ impl ToolExecutor for CheckoutTools {
         &'a self,
         configuration: (&'a crate::hooks::Hooks, [u8; 32]),
         event: crate::hooks::HookEvent,
-        input: serde_json::Value,
+        input: crate::hooks::HookInput<'a>,
         registry: &'a ToolRegistry,
         context: ToolContext,
         reconcile_only: bool,
-    ) -> BoxProviderFuture<'a, Result<crate::hooks::HookOutput>> {
+    ) -> BoxProviderFuture<'a, Result<Option<crate::hooks::HookOutput>>> {
         Box::pin(self.configured_hooks(
             configuration,
             event,
@@ -239,7 +239,7 @@ impl ToolExecutor for CheckoutTools {
             let fs = if let Some(command) = command {
                 match self.fs_arguments(&command, context.effective_scope()) {
                     Ok(parsed) => Some(parsed),
-                    Err(error) => return Ok(argument_error(error)),
+                    Err(error) => return Ok(crate::tools::rejected_input(error)),
                 }
             } else {
                 None
@@ -288,19 +288,24 @@ impl ToolExecutor for CheckoutTools {
                     let files =
                         output::Output::open(context, Arc::clone(&self.task_files), request)
                             .await?;
-                    let (result, mut state, mut files) =
-                        self.bash(input, maximum, state, files).await?;
-                    if !result.as_ref().is_ok_and(|result| {
-                        result
-                            .value
-                            .get("stop")
-                            .is_none_or(|stop| stop.is_null() || stop["cleanup_completed"] == true)
-                    }) {
-                        return Err(Error::Indeterminate(invocation.operation_id));
-                    }
+                    let mounts = Arc::clone(&state.mounts);
                     let publication = context.task().ordinary_journal_owner::<LocalStream>()?;
-                    publication.verify(true, &mut None).await?;
-                    workspace::volumes::sync(&state.mounts).await?;
+                    let (result, mut state, mut files) =
+                        workspace::volumes::native_scope(&mounts, async |claims| {
+                            let (result, state, files, claims) =
+                                self.bash(input, maximum, state, files, claims).await?;
+                            if !result.as_ref().is_ok_and(|result| {
+                                result.value.get("stop").is_none_or(|stop| {
+                                    stop.is_null() || stop["cleanup_completed"] == true
+                                })
+                            }) {
+                                return Err(Error::Indeterminate(invocation.operation_id));
+                            }
+                            // Verify the journal owner before the scope publishes.
+                            publication.verify(true, &mut None).await?;
+                            Ok(((result, state, files), claims))
+                        })
+                        .await?;
                     let State {
                         active, watcher, ..
                     } = &mut *state;
@@ -340,11 +345,5 @@ impl ToolExecutor for CheckoutTools {
             // A dispatched process must never be launched again after a lost ack.
             Ok(None)
         })
-    }
-}
-
-fn argument_error(error: Error) -> ToolResult {
-    ToolResult {
-        value: serde_json::json!({"error": error.to_string()}),
     }
 }

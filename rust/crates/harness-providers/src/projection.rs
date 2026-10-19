@@ -29,6 +29,14 @@ pub(crate) fn endpoint(provider: &ResolvedModel) -> Result<String> {
         Adapter::Chat => "chat/completions".into(),
         Adapter::Gemini => {
             let name = &provider.model.name;
+            #[cfg(all(test, not(target_arch = "wasm32")))]
+            let name = if crate::tests::catalog_identity_tests::SUBSTITUTE_WIRE_MODEL
+                .with(std::cell::Cell::get)
+            {
+                "unselected-model"
+            } else {
+                name
+            };
             if name.contains('/') || name.contains(':') || name.contains('?') || name.contains('#')
             {
                 return Err(invalid("invalid Gemini model name"));
@@ -123,7 +131,7 @@ pub(crate) fn body_with_files(
 pub(crate) fn body_named<'a>(
     provider: &ResolvedModel,
     request: &'a ModelRequest,
-    names: &crate::tool_names::Names,
+    names: &'a crate::tool_names::Names<'_>,
     target: &acyclic_harness::model::ReasoningOrigin,
     files: &mut FileText,
 ) -> Result<Body<'a>> {
@@ -168,8 +176,8 @@ pub(crate) fn body_named<'a>(
     system.retain(|text| !text.trim().is_empty());
     let max = request
         .max_output_tokens
-        .unwrap_or(provider.context_output());
-    if max == 0 || max > provider.context_output() {
+        .unwrap_or(provider.default_output_budget());
+    if !provider.capacity.permits_output(max) {
         return Err(invalid("requested output exceeds selected model capacity"));
     }
     let mut body = request.model.options.clone();
@@ -177,7 +185,15 @@ pub(crate) fn body_named<'a>(
     let map = body
         .as_object_mut()
         .ok_or_else(|| invalid("model options must be an object"))?;
-    map.insert("model".into(), json!(request.model.name));
+    let model = request.model.name.as_str();
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    let model =
+        if crate::tests::catalog_identity_tests::SUBSTITUTE_WIRE_MODEL.with(std::cell::Cell::get) {
+            "unselected-model"
+        } else {
+            model
+        };
+    map.insert("model".into(), json!(model));
     match adapter {
         Adapter::Chat => {
             map.insert("stream".into(), json!(true));
@@ -267,7 +283,7 @@ pub(crate) fn body_named<'a>(
 fn project_message<'a>(
     adapter: Adapter,
     message: &'a ModelMessage,
-    names: &crate::tool_names::Names,
+    names: &'a crate::tool_names::Names<'_>,
     call_ids: &crate::call_ids::CallIds,
     target: &acyclic_harness::model::ReasoningOrigin,
     gemini: &mut gemini::Replay<'a>,
@@ -380,7 +396,14 @@ fn project_message<'a>(
                 let name = names.wire(name)?;
                 let call_id = call_ids.wire(call_id)?;
                 let text = result_text(content, files)?;
+                let error = matches!(content, ToolResultContent::Error { .. });
                 let result = match adapter {
+                    Adapter::Anthropic if error => json!(
+                        {"type":"tool_result","tool_use_id":call_id,"content":text,"is_error":true}
+                    ),
+                    Adapter::Gemini if error => json!(
+                        {"functionResponse":{"id":call_id,"name":name,"response":{"error":text}}}
+                    ),
                     Adapter::Anthropic => {
                         json!({"type":"tool_result","tool_use_id":call_id,"content":text})
                     }
@@ -494,6 +517,7 @@ fn result_text(content: &ToolResultContent, files: &mut FileText) -> Result<Stri
             })
             .collect::<Result<Vec<_>>>()
             .map(|parts| parts.join("\n")),
+        ToolResultContent::Error { message, .. } => Ok(message.clone()),
     }
 }
 

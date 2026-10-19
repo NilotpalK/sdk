@@ -6,15 +6,18 @@ thread_local! {
     static TRACE: RefCell<Option<Box<dyn Any>>> = const { RefCell::new(None) };
 }
 
-/// Record an event; inactive recording does nothing. A mismatched event type panics.
+/// Record an event into an active capture of the same event type. Inactive
+/// recording, or an event of another type, does nothing: independent
+/// observation points share code paths, and a capture subscribes to exactly
+/// one of them by its type.
 pub fn record<T: 'static>(event: T) {
     let mut pending = Some(event);
     TRACE.with_borrow_mut(|trace| {
-        if let Some(trace) = trace {
-            trace
-                .downcast_mut::<Vec<T>>()
-                .expect("trace event type")
-                .push(pending.take().unwrap());
+        if let Some(trace) = trace
+            .as_mut()
+            .and_then(|trace| trace.downcast_mut::<Vec<T>>())
+        {
+            trace.push(pending.take().unwrap());
         }
     });
     // Inactive events may themselves record from Drop.
@@ -57,6 +60,29 @@ pub fn pair<S, R, T: 'static>(
     mut run: impl FnMut(S, bool) -> R,
 ) -> [(R, Vec<T>); 2] {
     [true, false].map(|old| observe(&mut initialize, |state| run(state, old)))
+}
+
+/// A named operation event. Observation points that share this type are told
+/// apart by name.
+pub type Operation = (&'static str, u64);
+
+/// `pair` over named operations, keeping only the named `kinds` in order: a
+/// capture subscribes to the operations it asserts, so another observation
+/// point on the same code path cannot enter its trace.
+pub fn pair_of<S, R>(
+    kinds: &[&str],
+    initialize: impl FnMut() -> S,
+    run: impl FnMut(S, bool) -> R,
+) -> [(R, Vec<Operation>); 2] {
+    pair::<S, R, Operation>(initialize, run).map(|(result, trace)| {
+        (
+            result,
+            trace
+                .into_iter()
+                .filter(|(kind, _)| kinds.contains(kind))
+                .collect(),
+        )
+    })
 }
 
 #[cfg(test)]

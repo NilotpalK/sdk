@@ -6,7 +6,7 @@ use std::path::Path;
 proptest! {
     #[test]
     fn recorded_provider_case_codec_and_exact_event_oracle(text in ".{0,48}", position in 0usize..4, protocol in 0usize..4) {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/scenarios");
+        let root = Path::new(acyclic_harness::build_metadata::MANIFEST_DIR).join("tests/scenarios");
         let mut value = scenario::load_value(&root, &root.join(format!("providers/{}/text.json", ["anthropic", "responses", "chat", "gemini"][protocol]))).map_err(TestCaseError::fail)?;
         value.as_object_mut().unwrap().remove("driver");
         value["prompt"] = text.clone().into();
@@ -61,7 +61,7 @@ proptest! {
 
 #[test]
 fn provider_case_rejects_ignored_fields_zero_chunks_and_unused_response_shapes() -> TestResult {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/scenarios");
+    let root = Path::new(acyclic_harness::build_metadata::MANIFEST_DIR).join("tests/scenarios");
     let mut value = scenario::load_value(&root, &root.join("providers/chat/text.json"))?;
     value.as_object_mut().ok_or("case")?.remove("driver");
     let case: ProviderCase = serde_json::from_value(value.clone())?;
@@ -78,6 +78,34 @@ fn provider_case_rejects_ignored_fields_zero_chunks_and_unused_response_shapes()
             serde_json::from_value::<ProviderCase>(broken)
                 .map_or(true, |case| case.validate().is_err()),
             "accepted {key}"
+        );
+    }
+    // A refused last response cannot complete; statuses must be HTTP and one per response.
+    for statuses in [
+        serde_json::json!([500]),
+        serde_json::json!([99]),
+        serde_json::json!([200, 200]),
+    ] {
+        let mut broken = value.clone();
+        broken["statuses"] = statuses;
+        assert!(
+            serde_json::from_value::<ProviderCase>(broken)?
+                .validate()
+                .is_err()
+        );
+    }
+    // A stalled last response cannot complete; stalls must name distinct, ascending responses.
+    for stalls in [
+        serde_json::json!([0]),
+        serde_json::json!([1]),
+        serde_json::json!([0, 0]),
+    ] {
+        let mut broken = value.clone();
+        broken["stalls"] = stalls;
+        assert!(
+            serde_json::from_value::<ProviderCase>(broken)?
+                .validate()
+                .is_err()
         );
     }
     for statuses in [
